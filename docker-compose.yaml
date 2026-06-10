@@ -1,0 +1,22 @@
+services:
+  mongodb_staging:
+    image: mongo:latest
+    container_name: school_mcp_staging_db
+    ports:
+      - "27117:27017"
+    volumes:
+      - staging_data:/data/db
+    restart: unless-stopped
+
+  mongodb_production:
+    image: mongo:latest
+    container_name: school_mcp_production_db
+    ports:
+      - "27118:27017"
+    volumes:
+      - production_data:/data/db
+    restart: unless-stopped
+
+volumes:
+  staging_data:
+  production_data:
