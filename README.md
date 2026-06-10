@@ -6,11 +6,11 @@ A portfolio-grade, secure, local-first School Management System utilizing a Mode
 
 ## 🏛️ Architecture Overview
 
-The system is built on a 3-tier decoupled architecture:
+The system is built on a 3-tier decoupled architecture and implements **both the MCP Client and MCP Server** locally:
 
 1. **Frontend (Vite + React)**: A premium, dark slate-blue glassmorphic user interface. It manages separate dashboard views and AI chats for Admins, Teachers, and Students, automatically injecting dropdown-selected active class context into the AI session.
-2. **Express API Gateway**: Acts as the orchestrator. It decodes user JWTs, tracks chat history, and executes an agentic loop using local Ollama model to call database tools dynamically.
-3. **TypeScript MCP Server**: Runs over stdio transport. It implements a 3-layer security pipeline (ReBAC, Query Firewall, and Production Sanitation) to validate and execute database actions on MongoDB.
+2. **Express API Gateway (MCP Client)**: Implements the **MCP Client** in `server/src/services/mcp.service.ts`. It spawns the MCP Server subprocess, connects via stdio, fetches tool schemas, and manages the agentic chat loop using a local Ollama model to call database tools dynamically.
+3. **TypeScript MCP Server (MCP Server)**: Implements the **MCP Server** in `server/src/server.ts`. Running over stdio transport, it registers all available database/statistical tools and runs a 3-layer security pipeline (ReBAC, Query Firewall, and Production Sanitation) to validate and execute database actions on MongoDB.
 4. **MongoDB Databases**: Multi-environment databases run inside Docker containers on port `27117` (Staging) and `27118` (Production).
 
 ---
