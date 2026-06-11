@@ -13,13 +13,13 @@ interface Message {
 // --- Role-based tool whitelisting ---
 type ToolName =
   | 'get_marks' | 'get_student_marks_summary' | 'get_student_best_performing_subject'
-  | 'upsert_mark' | 'list_classes' | 'get_class_details'
+  | 'upsert_mark' | 'list_classes' | 'get_assigned_classes' | 'get_class_details'
   | 'get_highest_mark_student' | 'get_lowest_mark_student' | 'calculate_class_statistics'
   | 'manage_class' | 'manage_teacher_assignment' | 'manage_student_enrollment' | 'raw_query';
 
 const ROLE_TOOL_WHITELIST: Record<string, ToolName[]> = {
   student: ['get_marks', 'get_student_best_performing_subject', 'get_student_marks_summary'],
-  teacher: ['get_marks', 'upsert_mark', 'list_classes', 'get_class_details', 'get_highest_mark_student', 'get_lowest_mark_student', 'calculate_class_statistics'],
+  teacher: ['get_marks', 'upsert_mark', 'get_assigned_classes', 'get_class_details', 'get_highest_mark_student', 'get_lowest_mark_student', 'calculate_class_statistics'],
   admin:   ['get_marks', 'upsert_mark', 'list_classes', 'get_class_details', 'manage_class', 'manage_teacher_assignment', 'manage_student_enrollment', 'raw_query'],
 };
 
@@ -55,6 +55,9 @@ async function getOllamaToolsForRole(role: string) {
 // before they are injected back into the model's context.
 // Prevents the model from leaking tool names to the end user.
 const SAFE_ERROR_MAP: Array<{ pattern: RegExp; message: string }> = [
+  { pattern: /invalid or missing gateway credentials/i,  message: 'Authentication failed. Please log in again.' },
+  { pattern: /cannot perform the .* action\. This requires one of the following roles/i,
+                                                              message: 'You do not have permission to perform that action. Please contact your admin if you need further assistance.' },
   { pattern: /not assigned to teach class/i,              message: 'You do not have access to that class.' },
   { pattern: /student is not enrolled in any of your/i,   message: 'That student is not in your assigned classes.' },
   { pattern: /students are not authorized to (view|modify)/i, message: 'You do not have permission to perform that action.' },
@@ -62,7 +65,7 @@ const SAFE_ERROR_MAP: Array<{ pattern: RegExp; message: string }> = [
   { pattern: /can only view your own/i,                   message: 'You can only view your own academic records.' },
   { pattern: /queries must strictly filter by your own/i, message: 'You can only view your own academic records.' },
   { pattern: /teachers cannot (access|modify)/i,          message: 'You do not have permission to perform that action.' },
-  { pattern: /admin/i,                                    message: 'That action requires administrator privileges.' },
+  { pattern: /requires administrator privileges/i,        message: 'This action can only be performed by an administrator. Please contact your admin.' },
   { pattern: /access denied/i,                            message: 'You do not have permission to perform that action.' },
   { pattern: /firewall/i,                                 message: 'That request was blocked for security reasons.' },
   { pattern: /destructive/i,                              message: 'That operation is not permitted.' },
@@ -242,7 +245,7 @@ async function resolveToolArgs(toolName: string, args: Record<string, any>): Pro
 export async function chatWithAgent(
   messages: Message[],
   token: string,
-  userProfile: { userId: string; name: string; role: string; email: string },
+  userProfile: { userId: string; name: string; role: string; email: string; assignedClassIds?: string[]; classId?: string },
   activeClassId?: string
 ): Promise<Message> {
   const config = getConfig();
@@ -255,30 +258,60 @@ export async function chatWithAgent(
     conversation.shift();
   }
 
-  const roleDescription = userProfile.role === 'student'
-    ? 'a student who can only view their own marks and academic records'
-    : userProfile.role === 'teacher'
-      ? 'a teacher who can view and update marks for students in their assigned classes'
-      : 'an administrator with full access to all school data';
+  const studentCapabilities = `
+YOUR TOOLS (role: student):
+  - get_marks: view your own marks
+  - get_student_best_performing_subject: find your best subject
+  - get_student_marks_summary: view your overall marks summary
+  You cannot update marks, view other students' records, or manage classes.
+  If asked to do something not covered by your tools, say: "I'm sorry, I don't have permission to do that."`;
+
+  const teacherCapabilities = `
+YOUR TOOLS (role: teacher):
+  Assigned classes: ${userProfile.assignedClassIds?.join(', ') || 'none'}
+  - get_assigned_classes: list your own assigned classes
+  - get_marks: view marks for a student or an entire class
+  - upsert_mark: create or update a student mark
+  - get_class_details: view class details, including the roster of enrolled students
+  - calculate_class_statistics: class average, highest, lowest
+  - get_highest_mark_student / get_lowest_mark_student: find top or bottom student
+  You cannot enroll students, create/delete classes, or manage teacher assignments.
+  If asked to do something not covered by your tools, say: "This action can only be performed by an administrator. Please contact your admin."`;
+
+  const adminCapabilities = `
+YOUR TOOLS (role: admin):
+  - list_classes: list all classes in the school
+  - get_marks / upsert_mark: view or update any marks
+  - get_class_details: view class details
+  - manage_class: create or delete a class
+  - manage_teacher_assignment: assign or unassign a teacher to a class
+  - manage_student_enrollment: enroll or unenroll a student from a class
+  - raw_query: run a direct database query
+  - get_highest_mark_student / get_lowest_mark_student / calculate_class_statistics: class analytics`;
+
+  const roleCapabilities = userProfile.role === 'student' ? studentCapabilities
+    : userProfile.role === 'teacher' ? teacherCapabilities
+    : adminCapabilities;
 
   let systemPrompt =
-`You are a School Management assistant.
+`You are a School Management assistant. You help users interact with school data using the tools available to you.
 
 CURRENT USER:
   Name:   ${userProfile.name}
-  Role:   ${userProfile.role} — ${roleDescription}
+  Role:   ${userProfile.role}
   userId: ${userProfile.userId}
   email:  ${userProfile.email}
+${roleCapabilities}
 
 CRITICAL RULES:
-1. When the user refers to themselves ("my marks", "my grades"), you MUST use their userId: "${userProfile.userId}". Never invent or guess a userId.
-2. GROUNDING RULE: You have no internal knowledge of students, classes, marks, or school data. You must use tools to retrieve or modify any school data. If you need data to answer a query, you MUST call the appropriate tool immediately in your first turn. Do not ask clarifying questions, offer options, or ask for permission first.
-3. When updating marks, the value must be a number between 0 and 100.
-4. If a tool returns a permission or access error, explain clearly and politely to the user that they do not have permission based on their role. Do not expose internal technical error details or database schemas.
-5. FINAL ANSWER RULE: The user CANNOT see the tool outputs. You MUST explicitly state the retrieved information (such as subjects, scores, names) in your response so they can read it. Output ONLY the clean, final, conversational response directly answering the user's query using the tool data. Do not write meta-commentary, reasoning blocks, JSON structures, or output prefix sentences like 'The tool returned...', 'Using this information...', or 'According to the database...'. Speak directly to the user as a helpful human assistant.`;
+1. IDENTITY RULE: When the user refers to themselves ("my marks", "my grades"), ALWAYS use their userId: "${userProfile.userId}". Never invent or guess a userId.
+2. GROUNDING RULE: You have zero internal knowledge of students, classes, or marks. You MUST use tools to fetch or modify any school data. Call the tool immediately — do not ask clarifying questions or offer options first.
+3. MARKS RANGE: When updating marks, the value must be a number between 0 and 100.
+4. FINAL ANSWER RULE: The user CANNOT see tool outputs directly. You MUST state the retrieved data explicitly in plain conversational language. Never output raw JSON, meta-commentary, or prefixes like "The tool returned..." or "According to the database...".
+5. ERROR RULE: If a tool returns an access or permission error, relay the exact message you receive clearly and politely. Never expose internal error details, stack traces, or database schemas.`;
 
   if (activeClassId) {
-    systemPrompt += `\n\n5. ACTIVE CLASS CONTEXT: Unless specified otherwise, default your class queries to class ID "${activeClassId}".`;
+    systemPrompt += `\n6. ACTIVE CLASS CONTEXT: Unless the user specifies otherwise, default your class queries to class ID "${activeClassId}".`;
   }
 
   // Insert system prompt at the start of every conversation if not present
@@ -315,6 +348,11 @@ CRITICAL RULES:
 
       if (!response.ok) {
         const errorText = await response.text();
+        // Detect ngrok/proxy HTML error pages and replace with a clean message
+        const isHtmlResponse = errorText.trim().startsWith('<');
+        if (isHtmlResponse || response.status === 503 || response.status === 502 || response.status === 504) {
+          throw new Error(`The AI model is currently unavailable (status ${response.status}). The Ollama server may be offline or the tunnel has disconnected. Please try again later.`);
+        }
         throw new Error(`Ollama API error (${response.status}): ${errorText}`);
       }
 

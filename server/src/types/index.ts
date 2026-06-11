@@ -5,6 +5,8 @@ export interface JWTPayload {
   email: string;
   role: UserRole;
   name: string;
+  assignedClassIds?: string[];
+  classId?: string;
 }
 
 export interface User {
@@ -36,6 +38,12 @@ export interface EnvConfig {
   database: {
     uri: string;
     dbName: string;
+    rootUri: string;
+    users: {
+      student: { username: string; password: string };
+      teacher: { username: string; password: string };
+      admin:   { username: string; password: string };
+    };
   };
   jwt: {
     secret: string;

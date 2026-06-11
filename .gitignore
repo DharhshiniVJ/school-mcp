@@ -16,6 +16,9 @@ client/dist/
 *.pem
 *.key
 
+# Local config with real credentials — use environments.example.yaml as template
+environments.yaml
+
 # Logs
 npm-debug.log*
 yarn-debug.log*

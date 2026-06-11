@@ -144,7 +144,9 @@ async function enforceRebac(
       if (!assignedClassIds.includes(directClassId)) {
         throw new Error(`Access Denied: You are not assigned to teach class "${directClassId}".`);
       }
-      return;
+      if (!directStudentId) {
+        return;
+      }
     }
 
     // Check Student-based access (e.g. upserting or fetching marks for a student)

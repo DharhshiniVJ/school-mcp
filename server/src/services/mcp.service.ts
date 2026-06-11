@@ -1,7 +1,18 @@
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { randomUUID } from 'crypto';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+
+/**
+ * A one-time secret generated when the gateway process starts.
+ * It is passed to the MCP server subprocess via env and injected
+ * into every _meta payload. The MCP server refuses any request
+ * that does not present this exact secret, blocking direct access
+ * from any client other than this gateway instance.
+ */
+const GATEWAY_SECRET = randomUUID();
+console.error(`[Gateway MCP Link] Gateway secret generated (${GATEWAY_SECRET.substring(0, 8)}...)`);
 
 let mcpClient: Client | null = null;
 
@@ -26,7 +37,9 @@ export async function initMcpClient(): Promise<Client> {
       ...process.env,
       NODE_ENV: process.env.NODE_ENV || 'staging',
       // Ensure it doesn't try to mock roles when invoked through the gateway
-      MOCK_ROLE: ''
+      MOCK_ROLE: '',
+      // Pass the one-time secret so the MCP server can verify its caller
+      GATEWAY_SECRET,
     }
   });
 
@@ -57,12 +70,12 @@ export async function initMcpClient(): Promise<Client> {
 export async function callMcpTool(toolName: string, toolArgs: any, token: string): Promise<any> {
   const client = await initMcpClient();
   
-  // Inject the token in standard metadata parameters
+  // Inject the token and gateway secret in standard metadata parameters
   const params = {
     name: toolName,
     arguments: {
       ...toolArgs,
-      _meta: { token }
+      _meta: { token, gatewaySecret: GATEWAY_SECRET }
     }
   };
 

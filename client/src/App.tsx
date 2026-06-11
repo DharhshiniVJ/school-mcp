@@ -9,6 +9,8 @@ export interface UserSession {
   name: string;
   email: string;
   role: 'admin' | 'teacher' | 'student';
+  assignedClassIds?: string[];
+  classId?: string;
 }
 
 function App() {

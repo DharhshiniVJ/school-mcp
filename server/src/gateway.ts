@@ -85,7 +85,9 @@ app.post('/api/auth/login', async (req, res) => {
       userId: user._id,
       email: user.email,
       role: user.role,
-      name: user.name
+      name: user.name,
+      assignedClassIds: user.assignedClassIds,
+      classId: user.classId
     };
 
     const token = signToken(tokenPayload);
@@ -96,7 +98,9 @@ app.post('/api/auth/login', async (req, res) => {
         userId: user._id,
         email: user.email,
         role: user.role,
-        name: user.name
+        name: user.name,
+        assignedClassIds: user.assignedClassIds,
+        classId: user.classId
       }
     });
   } catch (error: any) {
@@ -256,7 +260,9 @@ app.post('/api/chat', authenticateToken, async (req: AuthenticatedRequest, res) 
         userId: actor.userId,
         name: actor.name,
         role: actor.role,
-        email: actor.email
+        email: actor.email,
+        assignedClassIds: actor.assignedClassIds,
+        classId: actor.classId
       },
       activeClassId
     );
@@ -264,7 +270,11 @@ app.post('/api/chat', authenticateToken, async (req: AuthenticatedRequest, res) 
     res.json(agentResponse);
   } catch (error: any) {
     console.error('[Gateway Chat] Agent chat error:', error);
-    res.status(500).json({ error: `Agentic execution failed: ${error.message}` });
+    // Never forward raw internal errors (e.g. HTML pages, stack traces) to the client
+    const safeMessage = (error.message && !error.message.trim().startsWith('<'))
+      ? error.message
+      : 'The AI model is currently unavailable. Please try again later.';
+    res.status(500).json({ error: safeMessage });
   }
 });
 

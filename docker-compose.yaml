@@ -2,6 +2,7 @@ services:
   mongodb_staging:
     image: mongo:latest
     container_name: school_mcp_staging_db
+    command: mongod --auth
     ports:
       - "27117:27017"
     volumes:
@@ -11,6 +12,7 @@ services:
   mongodb_production:
     image: mongo:latest
     container_name: school_mcp_production_db
+    command: mongod --auth
     ports:
       - "27118:27017"
     volumes:

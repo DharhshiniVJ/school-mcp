@@ -9,6 +9,21 @@ import { verifyToken, signToken } from './security/jwt.js';
 import { runSecurityPipeline } from './security/pipeline.js';
 import { JWTPayload, User, Mark, Class } from './types/index.js';
 
+/**
+ * The gateway secret is injected as an env variable by the gateway process
+ * when it spawns this server as a stdio subprocess. Every inbound tool call
+ * must present this exact value in _meta.gatewaySecret or it is rejected
+ * immediately — before any JWT processing or DB access.
+ * If the env var is missing (e.g. direct invocation without the gateway),
+ * the server starts but every call will fail the secret check.
+ */
+const EXPECTED_GATEWAY_SECRET = process.env.GATEWAY_SECRET || '';
+if (!EXPECTED_GATEWAY_SECRET) {
+  console.error('[MCP Server] WARNING: GATEWAY_SECRET env var is not set. All requests will be rejected.');
+} else {
+  console.error('[MCP Server] Gateway secret loaded successfully.');
+}
+
 // Initialize the MCP Server
 const server = new Server(
   {
@@ -36,12 +51,24 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: 'string',
               description: 'Optional ID of the student. If omitted, returns all permitted marks based on caller role.',
             },
+            classId: {
+              type: 'string',
+              description: 'Optional ID of the class (e.g. class-math-101). If specified, filters results to only that class.',
+            },
           },
         },
       },
       {
         name: 'list_classes',
-        description: 'Retrieve a list of all classes available in the school system.',
+        description: 'Retrieve a list of ALL classes available in the ENTIRE school system (including classes taught by other teachers). To know which classes the current user teaches, refer to the CURRENT USER assignedClassIds in your system prompt.',
+        inputSchema: {
+          type: 'object',
+          properties: {},
+        },
+      },
+      {
+        name: 'get_assigned_classes',
+        description: 'Retrieve ONLY the classes that are explicitly assigned to you (the current user). Useful when you only want to know about your own classes.',
         inputSchema: {
           type: 'object',
           properties: {},
@@ -185,6 +212,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 
 // Helper to extract token and verify actor
 function extractActor(params: any): JWTPayload {
+  // ── Step 1: Gateway secret check ──────────────────────────────────────────
+  // Reject immediately if the caller doesn't know the one-time secret that
+  // was set by the gateway when it spawned this subprocess. This blocks any
+  // direct client that isn't the official gateway.
+  const incomingSecret =
+    params?._meta?.gatewaySecret ||
+    params?.arguments?._meta?.gatewaySecret;
+
+  if (!incomingSecret || incomingSecret !== EXPECTED_GATEWAY_SECRET) {
+    throw new Error('Unauthorized: Invalid or missing gateway credentials.');
+  }
+
+  // ── Step 2: JWT token extraction and verification ─────────────────────────
   let token = params?._meta?.token;
   
   // Check inside arguments if passed there by the gateway client
@@ -215,32 +255,54 @@ function extractActor(params: any): JWTPayload {
   return verifyToken(token);
 }
 
+/**
+ * Throws a clean, user-facing error if the actor's role is not in the allowedRoles list.
+ * This is the server-level last line of defence — independent of LLM routing or whitelists.
+ */
+function requireRole(actor: JWTPayload, allowedRoles: string[], toolName: string): void {
+  if (!allowedRoles.includes(actor.role)) {
+    const roleLabel = actor.role.charAt(0).toUpperCase() + actor.role.slice(1);
+    throw new Error(`Access Denied: ${roleLabel}s cannot perform the "${toolName}" action. This requires one of the following roles: ${allowedRoles.join(', ')}.`);
+  }
+}
+
 // Tool call handler
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
-  const db = await getDb();
 
   try {
     const actor = extractActor(request.params);
+    // Use the role-scoped DB connection — each role has its own MongoDB user
+    // with minimum required privileges enforced at the database level.
+    const db = await getDb(actor.role);
     console.error(`[MCP] Executing tool "${name}" called by ${actor.role} (${actor.email})`);
+
 
     switch (name) {
       case 'get_marks': {
         const studentId = args?.studentId as string | undefined;
-        
-        // Pipeline validation
-        await runSecurityPipeline(actor, 'marks', {}, studentId || null, null, false, db);
+        const classId = args?.classId as string | undefined;
 
         let query: any = {};
         if (studentId) {
           query.studentId = studentId;
-        } else {
-          if (actor.role === 'student') {
-            query.studentId = actor.userId;
-          } else if (actor.role === 'teacher') {
-            // Find students taught by teacher
-            const teacher = await db.collection<User>('users').findOne({ _id: actor.userId });
-            const assignedClassIds = teacher?.assignedClassIds || [];
+        }
+        if (classId) {
+          query.classId = classId;
+        }
+
+        if (actor.role === 'student') {
+          query.studentId = actor.userId;
+        } else if (actor.role === 'teacher') {
+          const teacher = await db.collection<User>('users').findOne({ _id: actor.userId });
+          const assignedClassIds = teacher?.assignedClassIds || [];
+          
+          if (classId) {
+            if (!assignedClassIds.includes(classId)) {
+              throw new Error(`Access Denied: You are not assigned to teach class "${classId}".`);
+            }
+          } else if (!studentId) {
+            // Teacher queries all marks for all assigned classes
             const students = await db.collection<User>('users')
               .find({ role: 'student', classId: { $in: assignedClassIds } })
               .toArray();
@@ -249,13 +311,34 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
 
+        // Pipeline validation: pass the constructed query and directStudentId/directClassId
+        await runSecurityPipeline(actor, 'marks', query, studentId || null, classId || null, false, db);
+
         const marks = await db.collection<Mark>('marks').find(query).toArray();
         return {
           content: [{ type: 'text', text: JSON.stringify(marks, null, 2) }],
         };
       }
 
+      case 'get_assigned_classes': {
+        requireRole(actor, ['teacher'], 'get_assigned_classes');
+        
+        await runSecurityPipeline(actor, 'classes', {}, null, null, false, db);
+
+        const teacher = await db.collection<User>('users').findOne({ _id: actor.userId });
+        const assignedClassIds = teacher?.assignedClassIds || [];
+
+        const classes = await db.collection<Class>('classes')
+          .find({ _id: { $in: assignedClassIds } })
+          .toArray();
+
+        return {
+          content: [{ type: 'text', text: JSON.stringify(classes, null, 2) }],
+        };
+      }
+
       case 'list_classes': {
+        requireRole(actor, ['admin'], 'list_classes');
         // Pipeline validation
         await runSecurityPipeline(actor, 'classes', {}, null, null, false, db);
 
@@ -332,6 +415,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'upsert_mark': {
+        requireRole(actor, ['teacher', 'admin'], 'upsert_mark');
         const studentId = args?.studentId as string;
         const classId = args?.classId as string;
         const markVal = Number(args?.mark);
@@ -383,6 +467,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'get_highest_mark_student': {
+        requireRole(actor, ['teacher', 'admin'], 'get_highest_mark_student');
         const classId = args?.classId as string;
 
         // Pipeline validation (Class-based access check)
@@ -411,6 +496,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'get_lowest_mark_student': {
+        requireRole(actor, ['teacher', 'admin'], 'get_lowest_mark_student');
         const classId = args?.classId as string;
 
         // Pipeline validation
@@ -439,6 +525,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'calculate_class_statistics': {
+        requireRole(actor, ['teacher', 'admin'], 'calculate_class_statistics');
         const classId = args?.classId as string;
 
         // Pipeline validation
@@ -541,6 +628,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'manage_class': {
+        requireRole(actor, ['admin'], 'manage_class');
         const action = args?.action as 'create' | 'delete';
         const classId = args?.classId as string;
         const className = args?.className as string | undefined;
@@ -571,6 +659,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'manage_teacher_assignment': {
+        requireRole(actor, ['admin'], 'manage_teacher_assignment');
         const teacherId = args?.teacherId as string;
         const classId = args?.classId as string;
         const action = args?.action as 'assign' | 'unassign';
@@ -621,6 +710,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'manage_student_enrollment': {
+        requireRole(actor, ['admin'], 'manage_student_enrollment');
         const studentId = args?.studentId as string;
         const classId = args?.classId as string;
         const action = args?.action as 'enroll' | 'unenroll';
@@ -659,6 +749,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'raw_query': {
+        requireRole(actor, ['admin'], 'raw_query');
         const collection = args?.collection as string;
         const filter = args?.filter as any;
         const options = args?.options as any;

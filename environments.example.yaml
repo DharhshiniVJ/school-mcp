@@ -1,0 +1,45 @@
+# environments.yaml — LOCAL ONLY, never commit this file
+# Copy this file to environments.yaml and fill in your own values.
+# See README.md for setup instructions.
+
+staging:
+  database:
+    uri: "mongodb://localhost:27117"
+    dbName: "school_staging"
+    rootUri: "mongodb://mongo_root:<ROOT_PASSWORD>@localhost:27117/admin"
+    users:
+      student: { username: "app_student", password: "<STUDENT_PASSWORD>" }
+      teacher: { username: "app_teacher", password: "<TEACHER_PASSWORD>" }
+      admin:   { username: "app_admin",   password: "<ADMIN_PASSWORD>" }
+  jwt:
+    secret: "<STAGING_JWT_SECRET_MIN_32_CHARS>"
+    expiresIn: "24h"
+  ollama:
+    endpoint: "http://localhost:11434"   # or your ngrok URL if running on Colab
+    model: "qwen2.5:14b"
+  security:
+    allowDestructiveCommands: true
+    enableFirewall: true
+    enableRebac: true
+    enableSanitation: true
+
+production:
+  database:
+    uri: "mongodb://localhost:27118"
+    dbName: "school_production"
+    rootUri: "mongodb://mongo_root:<ROOT_PASSWORD>@localhost:27118/admin"
+    users:
+      student: { username: "app_student", password: "<STUDENT_PASSWORD>" }
+      teacher: { username: "app_teacher", password: "<TEACHER_PASSWORD>" }
+      admin:   { username: "app_admin",   password: "<ADMIN_PROD_PASSWORD>" }
+  jwt:
+    secret: "<PRODUCTION_JWT_SECRET_MIN_32_CHARS>"
+    expiresIn: "2h"
+  ollama:
+    endpoint: "http://localhost:11434"
+    model: "llama3.1:8b"
+  security:
+    allowDestructiveCommands: false
+    enableFirewall: true
+    enableRebac: true
+    enableSanitation: true
