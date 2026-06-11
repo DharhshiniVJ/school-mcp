@@ -7,7 +7,7 @@ staging:
     expiresIn: "24h"
   ollama:
     endpoint: "http://localhost:11434"
-    model: "qwen2.5:1.5b"
+    model: "llama3.1:8b"
   security:
     allowDestructiveCommands: true # e.g. allowing seed resets
     enableFirewall: true
@@ -23,7 +23,7 @@ production:
     expiresIn: "2h"
   ollama:
     endpoint: "http://localhost:11434"
-    model: "qwen2.5:1.5b"
+    model: "llama3.1:8b"
   security:
     allowDestructiveCommands: false # strict block in production
     enableFirewall: true

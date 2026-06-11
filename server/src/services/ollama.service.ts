@@ -7,13 +7,10 @@ interface Message {
   content: string;
   name?: string;
   tool_calls?: any[];
+  tool_call_id?: string;
 }
 
-// --- FIX 1: Intent-based tool routing ---
-// Instead of sending all role-permitted tools at once, we classify the user's
-// last message and inject only the 2-3 tools relevant to that specific intent.
-// This prevents the 1.5B model from getting overwhelmed and producing empty responses.
-
+// --- Role-based tool whitelisting ---
 type ToolName =
   | 'get_marks' | 'get_student_marks_summary' | 'get_student_best_performing_subject'
   | 'upsert_mark' | 'list_classes' | 'get_class_details'
@@ -26,56 +23,18 @@ const ROLE_TOOL_WHITELIST: Record<string, ToolName[]> = {
   admin:   ['get_marks', 'upsert_mark', 'list_classes', 'get_class_details', 'manage_class', 'manage_teacher_assignment', 'manage_student_enrollment', 'raw_query'],
 };
 
-// Keywords → tools. Each bucket lists the 1-3 most likely tools for that intent.
-const INTENT_ROUTES: Array<{ keywords: string[]; tools: ToolName[] }> = [
-  { keywords: ['list class', 'all class', 'show class', 'classes available', 'what class'],           tools: ['list_classes'] },
-  { keywords: ['enroll', 'unenroll', 'remove student from'],                                          tools: ['manage_student_enrollment'] },
-  { keywords: ['assign teacher', 'unassign teacher'],                                                  tools: ['manage_teacher_assignment'] },
-  { keywords: ['create class', 'delete class', 'new class', 'remove class'],                          tools: ['manage_class'] },
-  { keywords: ['student in class', 'students in', 'roster', 'class detail', 'who is in', 'members of', 'enrolled in', 'teacher of'], tools: ['get_class_details'] },
-  { keywords: ['highest', 'top student', 'best student', 'highest mark'],                             tools: ['get_highest_mark_student'] },
-  { keywords: ['lowest', 'worst student', 'bottom student', 'lowest mark'],                           tools: ['get_lowest_mark_student'] },
-  { keywords: ['statistic', 'average', 'std dev', 'class average', 'class stats', 'class size'],      tools: ['calculate_class_statistics'] },
-  { keywords: ['update mark', 'set mark', 'give mark', 'assign mark', 'record mark', 'upsert'],       tools: ['upsert_mark'] },
-  { keywords: ['best subject', 'best performing', 'strongest subject'],                               tools: ['get_student_best_performing_subject'] },
-  { keywords: ['summary', 'all marks', 'overall', 'report card', 'all subject'],                     tools: ['get_student_marks_summary'] },
-  { keywords: ['my mark', 'my score', 'my grade', 'how did i', 'what did i get', 'show my'],         tools: ['get_marks', 'get_student_marks_summary'] },
-  { keywords: ['mark', 'score', 'grade', 'result'],                                                   tools: ['get_marks'] },
-];
-
-function routeToolsForIntent(userMessage: string, role: string): ToolName[] {
-  const lower = userMessage.toLowerCase();
-  const whitelist = ROLE_TOOL_WHITELIST[role] || ROLE_TOOL_WHITELIST['student'];
-
-  for (const route of INTENT_ROUTES) {
-    if (route.keywords.some(kw => lower.includes(kw))) {
-      // Intersect with role whitelist so a student can't accidentally get admin tools
-      const allowed = route.tools.filter(t => whitelist.includes(t));
-      if (allowed.length > 0) {
-        return allowed;
-      }
-    }
-  }
-
-  // Fallback: return a safe minimal set for the role
-  if (role === 'student') return ['get_marks', 'get_student_marks_summary'];
-  if (role === 'teacher') return ['list_classes', 'get_class_details', 'get_marks'];
-  return ['list_classes', 'get_class_details', 'get_marks'];
-}
-
 /**
- * Fetches only the tools relevant to the user's current intent.
- * Drastically reduces model context and prevents empty/silent responses.
+ * Fetches all tools permitted for the user's role.
  */
-async function getOllamaToolsForIntent(role: string, userMessage: string) {
+async function getOllamaToolsForRole(role: string) {
   try {
     const client = await initMcpClient();
     const toolsResponse = await client.listTools();
 
-    const intentTools = routeToolsForIntent(userMessage, role);
-    console.error(`[Ollama Service] Intent routing selected tools: [${intentTools.join(', ')}] for message: "${userMessage.slice(0, 60)}"`);
+    const whitelist = ROLE_TOOL_WHITELIST[role] || ROLE_TOOL_WHITELIST['student'];
+    const filtered = toolsResponse.tools.filter(t => whitelist.includes(t.name as ToolName));
 
-    const filtered = toolsResponse.tools.filter(t => intentTools.includes(t.name as ToolName));
+    console.error(`[Ollama Service] Exposing ${filtered.length} tools for role "${role}"`);
 
     return filtered.map((mcpTool) => ({
       type: 'function',
@@ -290,13 +249,12 @@ export async function chatWithAgent(
   const ollamaEndpoint = `${config.ollama.endpoint}/api/chat`;
   const ollamaModel = config.ollama.model;
 
-  // Clone messages to avoid mutating parameter array
+  // Clone messages to avoid mutating parameter array and filter out the static hello message
   const conversation = [...messages];
+  if (conversation.length > 0 && conversation[0].role === 'assistant' && conversation[0].content.startsWith('Hello')) {
+    conversation.shift();
+  }
 
-  // --- FIX 2: Inject authenticated user ID explicitly ---
-  // The model must NEVER guess the userId from name or email.
-  // We embed the exact database ID in the system prompt so it reads it directly.
-  // --- FIX 1 (system prompt): Forced JSON-only tool calling, no prose preamble ---
   const roleDescription = userProfile.role === 'student'
     ? 'a student who can only view their own marks and academic records'
     : userProfile.role === 'teacher'
@@ -304,99 +262,33 @@ export async function chatWithAgent(
       : 'an administrator with full access to all school data';
 
   let systemPrompt =
-`You are a School Management assistant. You have two modes:
+`You are a School Management assistant.
 
-MODE 1 — TOOL CALL (when you need data):
-Output ONLY a structured tool call. No prose, no explanation, no preamble.
-Never write "I will call..." or "Let me check...". Just emit the tool call directly.
-
-MODE 2 — FINAL ANSWER (after tool results are in your context):
-Write a clear, friendly, natural language response to the user.
-NEVER output raw JSON, tool call objects, or code blocks in your final answer.
-NEVER write {"name": ..., "arguments": ...} as a reply to the user.
-Format data as readable prose or a simple list — never as JSON.
-
-CURRENT USER (do not change these values under any circumstances):
+CURRENT USER:
   Name:   ${userProfile.name}
   Role:   ${userProfile.role} — ${roleDescription}
   userId: ${userProfile.userId}
   email:  ${userProfile.email}
 
-CRITICAL IDENTITY RULE:
-When the user refers to themselves ("my marks", "my scores", "my best subject"), ALWAYS use the exact userId above: "${userProfile.userId}".
-NEVER guess, derive, or infer the userId from their name or email. Use "${userProfile.userId}" verbatim.
-
-DATA RULE:
-You have NO internal knowledge of students, classes, marks, or school data.
-ALL answers MUST come from tool results. If you have not called a tool, you do not know the answer.
-NEVER invent names, emails, counts, scores, or any data.`;
+CRITICAL RULES:
+1. When the user refers to themselves ("my marks", "my grades"), you MUST use their userId: "${userProfile.userId}". Never invent or guess a userId.
+2. GROUNDING RULE: You have no internal knowledge of students, classes, marks, or school data. You must use tools to retrieve or modify any school data. If you need data to answer a query, you MUST call the appropriate tool immediately in your first turn. Do not ask clarifying questions, offer options, or ask for permission first.
+3. When updating marks, the value must be a number between 0 and 100.
+4. If a tool returns a permission or access error, explain clearly and politely to the user that they do not have permission based on their role. Do not expose internal technical error details or database schemas.
+5. FINAL ANSWER RULE: The user CANNOT see the tool outputs. You MUST explicitly state the retrieved information (such as subjects, scores, names) in your response so they can read it. Output ONLY the clean, final, conversational response directly answering the user's query using the tool data. Do not write meta-commentary, reasoning blocks, JSON structures, or output prefix sentences like 'The tool returned...', 'Using this information...', or 'According to the database...'. Speak directly to the user as a helpful human assistant.`;
 
   if (activeClassId) {
-    systemPrompt += `\n\nACTIVE CLASS CONTEXT:
-All queries default to class "${activeClassId}" unless the user explicitly names a different class.`;
+    systemPrompt += `\n\n5. ACTIVE CLASS CONTEXT: Unless specified otherwise, default your class queries to class ID "${activeClassId}".`;
   }
 
-  systemPrompt +=
-`\n\nPERMISSION RULE:
-If a tool returns an access error, tell the user in plain English that they do not have permission, based on their role.
-NEVER reveal internal tool names to the user.
-NEVER say "I don't have access" — say "You don't have permission as a ${userProfile.role}".
-NEVER output JSON or a tool call object as your reply to the user after receiving tool results.
-
-When updating marks, the value must be 0–100. Be concise and friendly.`;
-
-  // Few-shot examples teach the model the exact call format expected.
-  // IMPORTANT: All names, IDs, marks, and class names below are clearly fictional
-  // placeholder tokens (wrapped in [EXAMPLE_*]). This prevents the model from
-  // memorising them and hallucinating them as real database answers.
-  const fewShots: Message[] = [
-    { role: 'user', content: 'list all classes' },
-    {
-      role: 'assistant',
-      content: '',
-      tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'list_classes', arguments: {} } }]
-    },
-    {
-      role: 'tool', name: 'list_classes',
-      content: JSON.stringify([
-        { classId: '[EXAMPLE_CLASS_ID_1]', className: '[EXAMPLE_CLASS_NAME_1]', assignedTeacherName: '[EXAMPLE_TEACHER_NAME_1]' },
-        { classId: '[EXAMPLE_CLASS_ID_2]', className: '[EXAMPLE_CLASS_NAME_2]', assignedTeacherName: '[EXAMPLE_TEACHER_NAME_2]' }
-      ])
-    },
-    { role: 'assistant', content: 'Here are the available classes:\n- [EXAMPLE_CLASS_NAME_1] ([EXAMPLE_CLASS_ID_1]) — Teacher: [EXAMPLE_TEACHER_NAME_1]\n- [EXAMPLE_CLASS_NAME_2] ([EXAMPLE_CLASS_ID_2]) — Teacher: [EXAMPLE_TEACHER_NAME_2]' },
-    { role: 'user', content: 'list all students of [EXAMPLE_CLASS_NAME_1]' },
-    {
-      role: 'assistant',
-      content: '',
-      tool_calls: [{ id: 'call_2', type: 'function', function: { name: 'get_class_details', arguments: { classId: '[EXAMPLE_CLASS_NAME_1]' } } }]
-    },
-    {
-      role: 'tool', name: 'get_class_details',
-      content: JSON.stringify({ classId: '[EXAMPLE_CLASS_ID_1]', className: '[EXAMPLE_CLASS_NAME_1]', teacherName: '[EXAMPLE_TEACHER_NAME_1]', enrolledStudents: ['[EXAMPLE_STUDENT_NAME_1]', '[EXAMPLE_STUDENT_NAME_2]'] })
-    },
-    { role: 'assistant', content: '[EXAMPLE_CLASS_NAME_1] has 2 enrolled students:\n- [EXAMPLE_STUDENT_NAME_1]\n- [EXAMPLE_STUDENT_NAME_2]' },
-    { role: 'user', content: 'show my marks' },
-    {
-      role: 'assistant',
-      content: '',
-      tool_calls: [{ id: 'call_3', type: 'function', function: { name: 'get_student_marks_summary', arguments: { studentId: userProfile.userId } } }]
-    },
-    {
-      role: 'tool', name: 'get_student_marks_summary',
-      content: JSON.stringify({ studentId: userProfile.userId, overallAverage: '[EXAMPLE_AVG]', subjectsCount: 2, subjects: [{ className: '[EXAMPLE_CLASS_NAME_1]', mark: '[EXAMPLE_MARK_1]' }, { className: '[EXAMPLE_CLASS_NAME_2]', mark: '[EXAMPLE_MARK_2]' }] })
-    },
-    { role: 'assistant', content: `Here is your marks summary:\n- [EXAMPLE_CLASS_NAME_1]: [EXAMPLE_MARK_1]\n- [EXAMPLE_CLASS_NAME_2]: [EXAMPLE_MARK_2]\n\nOverall Average: [EXAMPLE_AVG]` }
-  ];
-
-  // Insert system prompt + few-shots at the start of every conversation
+  // Insert system prompt at the start of every conversation if not present
   const hasSystem = conversation.some(m => m.role === 'system');
   if (!hasSystem) {
-    conversation.unshift({ role: 'system', content: systemPrompt }, ...fewShots);
+    conversation.unshift({ role: 'system', content: systemPrompt });
   }
 
-  // --- FIX 1 (intent routing): select only 2-3 tools relevant to this query ---
-  const lastUserMessage = [...messages].reverse().find(m => m.role === 'user')?.content || '';
-  const tools = await getOllamaToolsForIntent(userProfile.role, lastUserMessage);
+  // Load all whitelisted tools for the user's role
+  const tools = await getOllamaToolsForRole(userProfile.role);
 
   let iterations = 0;
   const maxIterations = 5;
@@ -433,24 +325,11 @@ When updating marks, the value must be 0–100. Be concise and friendly.`;
       if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
         console.error('[Ollama Service] No tool calls requested. Completed agentic execution.');
 
-        // --- JSON bleed-through guard ---
-        // If the model ignored MODE 2 instructions and returned a raw JSON tool
-        // call object as its content instead of natural language, intercept it
-        // and force another iteration with an explicit correction prompt.
-        const content = (responseMessage.content || '').trim();
-        const looksLikeToolCallJson =
-          /^\s*\{\s*"(name|function|tool_call|arguments)"\s*:/i.test(content) ||
-          /^\s*\[\s*\{\s*"(name|function)"\s*:/i.test(content);
-
-        if (looksLikeToolCallJson && iterations < maxIterations) {
-          console.error('[Ollama Service] Model returned raw JSON as final answer. Injecting correction...');
-          conversation.push(responseMessage);
-          conversation.push({
-            role: 'user',
-            content: 'Please rewrite your last response as a clear, friendly plain English sentence or list. Do not output JSON or code.'
-          });
-          continue; // retry the loop
-        }
+        let cleanContent = responseMessage.content || '';
+        cleanContent = cleanContent.replace(/^(the tool|according to the|based on the|using the|i called the|i have called the|i've called the|the database)[^,.:]*[,.:]\s*/i, '');
+        cleanContent = cleanContent.replace(/^(the output from this call indicates that|the result indicates that|here is the information returned)[^,.:]*[,.:]\s*/i, '');
+        cleanContent = cleanContent.replace(/^(here is the information returned)[^:]*:\s*/i, '');
+        responseMessage.content = cleanContent;
 
         return responseMessage;
       }
@@ -488,7 +367,7 @@ When updating marks, the value must be 0–100. Be concise and friendly.`;
           } else {
             userFacing = 'Could not find the requested student or class. Please check the name and try again.';
           }
-          conversation.push({ role: 'tool', name: toolName, content: `RESOLVE_ERROR: ${userFacing}` });
+          conversation.push({ role: 'tool', name: toolName, content: `RESOLVE_ERROR: ${userFacing}`, tool_call_id: toolCall.id });
           console.error(`[Resolver] Resolution failed for "${toolName}": ${msg}`);
           continue;
         }
@@ -498,19 +377,12 @@ When updating marks, the value must be 0–100. Be concise and friendly.`;
           const toolResponse = await callMcpTool(toolName, resolvedArgs, token);
 
           if (toolResponse.isError) {
-            // --- FIX 4: Sanitize error messages before injecting into model context ---
-            // The raw error from the security pipeline contains internal tool names
-            // and technical details. We replace them with safe, user-friendly strings
-            // so the model cannot leak them to the end user.
             const rawError = toolResponse.content[0]?.text || 'Unknown error';
             console.error(`[Ollama Service] Tool "${toolName}" returned security error: ${rawError}`);
             resultText = `ACCESS_DENIED: ${sanitizeToolError(rawError)}`;
           } else {
             resultText = toolResponse.content.map((c: any) => c.text).join('\n');
 
-            // --- FIX 3: Hallucination guard ---
-            // If the tool returned an empty or suspiciously short result, log it so
-            // we can detect if the model starts fabricating a follow-up answer.
             if (!resultText || resultText.trim().length < 5) {
               resultText = 'No data found for this query.';
             }
@@ -526,7 +398,8 @@ When updating marks, the value must be 0–100. Be concise and friendly.`;
         conversation.push({
           role: 'tool',
           name: toolName,
-          content: resultText
+          content: resultText,
+          tool_call_id: toolCall.id
         });
       }
     } catch (error: any) {

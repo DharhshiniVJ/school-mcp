@@ -68,23 +68,47 @@ Open `http://localhost:5173` in your browser.
 
 ---
 
-## 🧠 Local Model (1.5B) Challenges & Optimizations
+## 🧠 Model Evolution, Latency & GPU Offloading
 
-We initially developed and tested the chat assistant using Ollama's **`qwen2.5:1.5b`** model. Because this local model is extremely lightweight (1.5B parameters), we faced major integration hurdles:
+We initially developed the chat assistant using Ollama's **`qwen2.5:1.5b`** model, but hit severe reasoning limits:
+* **The Issues (1.5B)**: Context overwhelm, outputting conversational preambles that broke the JSON tool parser, parameter guessing (hallucinating student IDs), and making up fictional student rosters.
+* **The Solutions (1.5B)**: Had to implement keyword-based tool intent routing, inject extensive few-shot prompt examples, and code JSON bleed-through recovery loops.
 
-### The Issues:
-* **Tool Overwhelm**: Exposing the model to all 13 database tools at once bloated the context window, causing the model to get confused, hallucinate database data, or return blank responses.
-* **Conversational Preambles**: The model frequently wrote introductory remarks (e.g. *"I will now call get_class_details to find the students..."*) before outputting the actual tool call. Ollama's parser gets confused by this conversational text and returns an empty message.
-* **ID Guessing**: When querying records, the model guessed parameter IDs using the user's email address or name instead of their true database ID, causing the MCP security pipeline to reject requests.
-* **Parametric Hallucination**: When asked class-roster questions, the model bypassed calling the tools entirely and hallucinated fictional student lists and email addresses.
+### 🚀 Upgrading to Llama 3 8B (`llama3.1:8b`)
+To build a more robust agent, we upgraded the backend configuration to **Llama 3 8B**. 
+* **The Result**: Excellent tool-use reasoning, native schema parsing, and strong rule compliance.
+* **Code Refactoring**: We stripped away the intent-routing hacks, the mock few-shot arrays (saving **1,000+ tokens of context overhead** per request), and the JSON bleed guards. The gateway now runs a clean, minimal orchestrator.
 
-### How We Solved It in Code:
-We implemented several optimizations in the API Gateway's [ollama.service.ts](server/src/services/ollama.service.ts):
-1. **Role-Based Tool Filtering**: The gateway filters and exposes only the relevant subset of tools based on the user's logged-in role (3 tools for Students, 7 for Teachers, and 8 for Admins) to prevent context bloat.
-2. **Few-Shot Priming**: Prepended new chat sessions with brief mock message turns demonstrating how to output tool-call JSON directly without conversational preambles.
-3. **ID Injection**: Injected the user's database `userId` directly into the LLM's system prompt context.
+### 🐌 The CPU Latency Challenge
+While Llama 3 8B is far more intelligent, running a 8B model locally on a CPU or integrated GPU (like Intel Iris Xe) results in **extremely high response latency** (often taking **30 to 90 seconds** per message exchange).
 
-### Recommended Upgrades:
-For a truly seamless, native tool-calling experience without prompt hacks, we highly recommend upgrading:
-* **Option A (Local upgrade)**: Pull a slightly larger model like **`qwen2.5:3b`** or **`llama3.1:8b`** via Ollama. They have significantly better reasoning and follow tool schemas natively.
-* **Option B (Cloud upgrade)**: Switch the gateway orchestrator to use a **Gemini API Key** (e.g. Gemini 1.5 Flash). It is lightning-fast, extremely intelligent, free of cost on the developer tier, and offloads all processor load from your local machine.
+### ⚡ Recommended Offloading Solution: Google Colab + Ngrok
+To get near-instant response speeds (**30+ tokens/second**) without stressing local hardware, you can run the model on a free Google Colab GPU and tunnel it to your gateway using Ngrok:
+
+1. **In Google Colab** (with a GPU runtime):
+   * Install Ollama:
+     ```bash
+     !curl -fsSL https://ollama.com/install.sh | sh
+     ```
+   * Start the Ollama server in the background:
+     ```python
+     import os, subprocess, time
+     os.environ['OLLAMA_HOST'] = '0.0.0.0'
+     subprocess.Popen(["ollama", "serve"])
+     time.sleep(3)
+     ```
+   * Pull Llama 3:
+     ```bash
+     !ollama pull llama3.1:8b
+     ```
+   * Expose the port via Ngrok (sign up for a free token at `ngrok.com`):
+     ```python
+     !pip install pyngrok
+     from pyngrok import ngrok
+     ngrok.set_auth_token("YOUR_NGROK_AUTHTOKEN")
+     tunnel = ngrok.connect(11434, "http")
+     print("Public URL:", tunnel.public_url)
+     ```
+2. **In your local codebase**:
+   * Open `environments.yaml` and update the `ollama.endpoint` with your new Ngrok URL (e.g. `https://xxxx.ngrok-free.app`).
+   * Restart the gateway server. Your local app will now run with cloud GPU speeds.
