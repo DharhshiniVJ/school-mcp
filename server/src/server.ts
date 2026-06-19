@@ -514,7 +514,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Fetch enrolled students
         const students = await db.collection<User>('users').find({
           role: 'student',
-          classId: canonicalClassId
+          classIds: canonicalClassId
         }).toArray();
 
         const responseObj = {
@@ -693,7 +693,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         const bestMark = bestMarks[0];
-        const classObj = await db.collection<Class>('classes').findOne({ _id: bestMark.classId });
+        const adminDb = await getDb('admin');
+        const classObj = await adminDb.collection<Class>('classes').findOne({ _id: bestMark.classId });
 
         return {
           content: [{
@@ -719,8 +720,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const sum = studentMarks.reduce((acc, m) => acc + m.mark, 0);
         const average = Number((sum / total).toFixed(2));
 
-        // Fetch display names for classes
-        const classesList = await db.collection<Class>('classes').find().toArray();
+        // Fetch display names for classes (requires admin connection because students cannot read the global classes collection)
+        const adminDb = await getDb('admin');
+        const classesList = await adminDb.collection<Class>('classes').find().toArray();
         const classMap = new Map(classesList.map(c => [c._id, c.name]));
 
         const marksList = studentMarks.map(m => ({

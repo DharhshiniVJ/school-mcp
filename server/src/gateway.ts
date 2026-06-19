@@ -4,7 +4,7 @@ import { getDb, closeDb } from './config/db.js';
 import { getConfig } from './config/env.js';
 import { comparePassword, hashPassword, verifyToken, signToken } from './security/jwt.js';
 import { callMcpTool } from './services/mcp.service.js';
-import { chatWithAgent } from './services/ollama.service.js';
+import { chatWithAgent } from './services/llm.service.js';
 import { JWTPayload, User, Class } from './types/index.js';
 
 const app = express();
@@ -270,10 +270,21 @@ app.post('/api/chat', authenticateToken, async (req: AuthenticatedRequest, res) 
     res.json(agentResponse);
   } catch (error: any) {
     console.error('[Gateway Chat] Agent chat error:', error);
-    // Never forward raw internal errors (e.g. HTML pages, stack traces) to the client
-    const safeMessage = (error.message && !error.message.trim().startsWith('<'))
-      ? error.message
-      : 'The AI model is currently unavailable. Please try again later.';
+    // Rewrite raw technical errors (like JSON rate limits) into friendly chat messages
+    let safeMessage = 'The AI model is currently unavailable. Please try again later.';
+    
+    if (error.message) {
+      const msg = error.message.toLowerCase();
+      if (msg.includes('429') || msg.includes('rate limit') || msg.includes('rate_limit')) {
+        safeMessage = "I'm currently experiencing high traffic and hit a rate limit. Please wait a moment and try asking me again!";
+      } else if (msg.includes('llm api error')) {
+        safeMessage = "I encountered a minor internal glitch processing that request. Could you please rephrase or try again?";
+      } else if (!error.message.trim().startsWith('<')) {
+        // Pass through any other clean errors
+        safeMessage = error.message;
+      }
+    }
+
     res.status(500).json({ error: safeMessage });
   }
 });

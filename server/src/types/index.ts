@@ -49,9 +49,10 @@ export interface EnvConfig {
     secret: string;
     expiresIn: string;
   };
-  ollama: {
+  llm: {
     endpoint: string;
     model: string;
+    apiKey: string;
   };
   security: {
     allowDestructiveCommands: boolean;

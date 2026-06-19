@@ -19,7 +19,7 @@ type ToolName =
 
 const ROLE_TOOL_WHITELIST: Record<string, ToolName[]> = {
   student: ['get_marks', 'get_student_best_performing_subject', 'get_student_marks_summary', 'list_classes'],
-  teacher: ['get_marks', 'upsert_mark', 'get_assigned_classes', 'list_classes', 'get_class_details', 'get_highest_mark_student', 'get_lowest_mark_student', 'calculate_class_statistics'],
+  teacher: ['get_marks', 'upsert_mark', 'get_assigned_classes', 'get_class_details', 'get_highest_mark_student', 'get_lowest_mark_student', 'calculate_class_statistics'],
   admin:   ['get_marks', 'upsert_mark', 'list_classes', 'list_users', 'get_class_details', 'manage_class', 'manage_teacher_assignment', 'manage_student_enrollment', 'raw_query', 'manage_user'],
 };
 
@@ -292,13 +292,19 @@ export async function chatWithAgent(
   activeClassId?: string
 ): Promise<Message> {
   const config = getConfig();
-  const ollamaEndpoint = `${config.ollama.endpoint}/api/chat`;
-  const ollamaModel = config.ollama.model;
+  const llmEndpoint = config.llm.endpoint;
+  const llmModel = config.llm.model;
+  const apiKey = config.llm.apiKey;
 
   // Clone messages to avoid mutating parameter array and filter out the static hello message
-  const conversation = messages.map(m => ({ ...m }));
+  let conversation = messages.map(m => ({ ...m }));
   if (conversation.length > 0 && conversation[0].role === 'assistant' && conversation[0].content.startsWith('Hello')) {
     conversation.shift();
+  }
+
+  // Truncate conversation to keep token usage low (last 8 messages)
+  if (conversation.length > 8) {
+    conversation = conversation.slice(-8);
   }
 
   // Preprocess the conversation history to mark assistant messages as generated via the database.
@@ -310,72 +316,42 @@ export async function chatWithAgent(
     }
   }
 
-  const studentCapabilities = `
-YOUR TOOLS (role: student):
-  - get_marks: view your own marks
-  - get_student_best_performing_subject: find your best subject
-  - get_student_marks_summary: view your overall marks summary
-  - list_classes: view the class you are currently enrolled in
-  You cannot update marks, view other students' records, or manage classes.
-  If asked to do something not covered by your tools, say: "I'm sorry, I don't have permission to do that."`;
+  const studentCapabilities = `ROLE: Student. You can view your own marks, summary, and best subject. You cannot update marks or manage classes.`;
 
-  const teacherCapabilities = `
-YOUR TOOLS (role: teacher):
-  Assigned classes: ${userProfile.assignedClassIds?.join(', ') || 'none'}
-  - list_classes: list only the classes you are assigned to teach
-  - get_assigned_classes: alternative way to list your assigned classes
-  - get_marks: view marks for a student or an entire class
-  - upsert_mark: create or update a student mark
-  - get_class_details: view class details, including the roster of enrolled students
-  - calculate_class_statistics: class average, highest, lowest
-  - get_highest_mark_student / get_lowest_mark_student: find top or bottom student
-  You cannot enroll students, create/delete classes, or manage teacher assignments.
-  If asked to do something not covered by your tools, say: "This action can only be performed by an administrator. Please contact your admin."`;
+  const teacherCapabilities = `ROLE: Teacher. Assigned classes: ${userProfile.assignedClassIds?.join(', ') || 'none'}. You can view marks, update marks, get class rosters, calculate class averages, and find the highest or lowest performing students in your classes.`;
 
-  const adminCapabilities = `
-YOUR TOOLS (role: admin):
-  - list_users: list all teachers, students, or admins in the system (pass role=teacher, role=student, or role=admin to filter)
-  - list_classes: list all classes in the school; pass teacherId to see a specific teacher's classes, or studentId to see a specific student's class
-  - get_marks / upsert_mark: view or update any marks
-  - get_class_details: view class details
-  - manage_class: create or delete a class
-  - manage_teacher_assignment: assign or unassign a teacher to a class
-  - manage_student_enrollment: enroll or unenroll a student from a class
-  - raw_query: run a direct database query
-  - get_highest_mark_student / get_lowest_mark_student / calculate_class_statistics: class analytics
-  IMPORTANT: Use list_users to look up real teacher/student data. Never generate names or emails from memory.`;
+  const adminCapabilities = `ROLE: Admin. You have full system access. You can manage users, assign teachers, enroll students, and run any class analytics (highest, lowest, averages). Use list_users for lookups.`;
 
   const roleCapabilities = userProfile.role === 'student' ? studentCapabilities
     : userProfile.role === 'teacher' ? teacherCapabilities
     : adminCapabilities;
 
   let systemPrompt =
-`You are a School Management assistant. You help users interact with school data using the tools available to you.
-
-CURRENT USER:
-  Name:   ${userProfile.name}
-  Role:   ${userProfile.role}
-  userId: ${userProfile.userId}
-  email:  ${userProfile.email}
+`You are a School DB Assistant. You are NOT the user.
+USER: Name:${userProfile.name}, Role:${userProfile.role}, ID:${userProfile.userId}, Email:${userProfile.email}
 ${roleCapabilities}
 
-CRITICAL RULES:
-1. LANGUAGE RULE: You MUST always respond in English only, regardless of any other language that appears in the conversation, names, or data. Never switch to any other language.
-2. IDENTITY RULE: When the user refers to themselves ("my marks", "my grades"), ALWAYS use their userId: "${userProfile.userId}". Never invent or guess a userId.
-3. GROUNDING RULE: First try to use a tool call. If a tool doesn't exist to answer the user's request, you MUST say that you don't have a tool to retrieve that information. DO NOT make things up like that. If the chat history contains names or data that were not returned by a tool, IGNORE THEM. Every piece of school data must come from a tool.
-4. MARKS RANGE: When updating marks, the value must be a number between 0 and 100.
-5. FINAL ANSWER RULE: The user CANNOT see tool outputs directly. You MUST state the retrieved data explicitly in plain conversational language. Never output raw JSON, meta-commentary, or prefixes like "The tool returned..." or "According to the database...".
-6. ERROR RULE: If a tool returns an access or permission error, relay the exact message you receive clearly and politely. Never expose internal error details, stack traces, or database schemas.
-7. MISSING PARAMETERS RULE: If the user asks you to perform an action (like creating a class or user) but does not provide required details (like names, IDs, or emails), DO NOT invent or guess them. Reply and ask the user for the missing details first.`;
+RULES:
+1. English only.
+2. User's ID is "${userProfile.userId}".
+3. Use tools. Don't invent data. Ignore unretrieved data.
+4. Marks: 0-100.
+5. No raw JSON/meta-commentary. Answer conversationally.
+6. Relay exact access errors politely.
+7. Ask for missing params instead of guessing.
+8. Be EXTREMELY brief. Just answer the question.`;
 
   if (activeClassId) {
-    systemPrompt += `\n8. ACTIVE CLASS CONTEXT: Unless the user specifies otherwise, default your class queries to class ID "${activeClassId}".`;
+    systemPrompt += `\n9. ACTIVE CLASS: Default queries to class ID "${activeClassId}".`;
   }
 
   // Insert system prompt at the start of every conversation if not present
   const hasSystem = conversation.some(m => m.role === 'system');
   if (!hasSystem) {
     conversation.unshift({ role: 'system', content: systemPrompt });
+  } else {
+    const sysIdx = conversation.findIndex(m => m.role === 'system');
+    conversation[sysIdx].content = systemPrompt;
   }
 
   // Load all whitelisted tools for the user's role
@@ -397,41 +373,95 @@ CRITICAL RULES:
 
   while (iterations < maxIterations) {
     iterations++;
-    console.error(`[Ollama Service] Iteration ${iterations}. Calling Ollama endpoint...`);
+    console.error(`[LLM Service] Iteration ${iterations}. Calling LLM endpoint...`);
 
     const requestBody = {
-      model: ollamaModel,
+      model: llmModel,
       messages: conversation,
       tools: tools.length > 0 ? tools : undefined,
       stream: false
     };
 
     try {
-      const response = await fetch(ollamaEndpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'ngrok-skip-browser-warning': 'true'
-        },
-        body: JSON.stringify(requestBody)
-      });
+      let response: Response;
+      let retryCount = 0;
+      
+      while (true) {
+        response = await fetch(llmEndpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`
+          },
+          body: JSON.stringify(requestBody)
+        });
+
+        if (response.status === 429 && retryCount < 3) {
+          console.error(`[LLM Service] Rate limit reached (429). Waiting 8 seconds before retrying (Attempt ${retryCount + 1}/3)...`);
+          await new Promise(resolve => setTimeout(resolve, 8000));
+          retryCount++;
+          continue;
+        }
+        break;
+      }
+
+      let responseData: any = null;
 
       if (!response.ok) {
         const errorText = await response.text();
-        // Detect ngrok/proxy HTML error pages and replace with a clean message
         const isHtmlResponse = errorText.trim().startsWith('<');
         if (isHtmlResponse || response.status === 503 || response.status === 502 || response.status === 504) {
-          throw new Error(`The AI model is currently unavailable (status ${response.status}). The Ollama server may be offline or the tunnel has disconnected. Please try again later.`);
+          throw new Error(`The AI model is currently unavailable (status ${response.status}). The server may be offline or the tunnel has disconnected. Please try again later.`);
         }
-        throw new Error(`Ollama API error (${response.status}): ${errorText}`);
+
+        // --- Attempt to recover Groq's 400 tool_use_failed errors ---
+        if (response.status === 400) {
+          try {
+            const errObj = JSON.parse(errorText);
+            if (errObj.error?.code === 'tool_use_failed' && errObj.error?.failed_generation) {
+              const fg = errObj.error.failed_generation as string;
+              // Extract e.g.: <function=get_class_details{"classId": "class-math-101"}</function>
+              const match = fg.match(/<function=([a-zA-Z0-9_]+)(.*?)<\/function>/s);
+              if (match) {
+                console.error(`[LLM Service] Recovered malformed tool call from Groq 400 error: ${match[1]}`);
+                responseData = {
+                  choices: [{
+                    message: {
+                      role: 'assistant',
+                      content: '',
+                      tool_calls: [{
+                        id: `call_${Math.random().toString(36).substring(7)}`,
+                        type: 'function',
+                        function: {
+                          name: match[1],
+                          arguments: match[2]
+                        }
+                      }]
+                    }
+                  }]
+                };
+              }
+            }
+          } catch (e) {
+            // ignore parse errors, fallback to throwing
+          }
+        }
+
+        if (!responseData) {
+          throw new Error(`LLM API error (${response.status}): ${errorText}`);
+        }
+      } else {
+        responseData = (await response.json()) as any;
+        if (responseData.error) {
+          throw new Error(`LLM API error: ${responseData.error.message}`);
+        }
       }
 
-      const responseData = (await response.json()) as any;
-      const responseMessage = responseData.message as Message;
+      const responseMessage = responseData.choices[0].message as Message;
 
-      // If Ollama didn't request any tool calls, we are finished!
+      // If LLM didn't request any tool calls, we are finished!
       if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
-        console.error('[Ollama Service] No tool calls requested. Completed agentic execution.');
+        console.error('[LLM Service] No tool calls requested. Completed agentic execution.');
 
         let cleanContent = responseMessage.content || '';
         cleanContent = cleanContent.replace(/^\[Generated via Database\]\s*/i, '');
@@ -456,7 +486,7 @@ CRITICAL RULES:
         return responseMessage;
       }
 
-      console.error(`[Ollama Service] Model requested ${responseMessage.tool_calls.length} tool call(s).`);
+      console.error(`[LLM Service] Model requested ${responseMessage.tool_calls.length} tool call(s).`);
       
       // Append the assistant's tool-calling intent message to the conversation log
       conversation.push(responseMessage);
@@ -464,9 +494,18 @@ CRITICAL RULES:
       // Execute each tool requested by Ollama
       for (const toolCall of responseMessage.tool_calls) {
         const toolName = toolCall.function.name;
-        const toolArgs = toolCall.function.arguments;
+        let toolArgs = toolCall.function.arguments;
+        
+        // OpenAI/Groq returns arguments as a JSON string, Ollama natively returned an object.
+        if (typeof toolArgs === 'string') {
+          try {
+            toolArgs = JSON.parse(toolArgs);
+          } catch (e) {
+            toolArgs = {};
+          }
+        }
 
-        console.error(`[Ollama Service] Executing tool: ${toolName} with arguments:`, toolArgs);
+        console.error(`[LLM Service] Executing tool: ${toolName} with arguments:`, toolArgs);
 
         // --- Argument resolver ---
         // Resolve any name/email/partial guesses to real database IDs before
@@ -526,15 +565,22 @@ CRITICAL RULES:
       }
     } catch (error: any) {
       console.error('[Ollama Service] Error during agent communication:', error);
-      if (error.message?.includes('fetch failed')) {
-        return {
-          role: 'assistant',
-          content: 'Agent not reachable: Could not connect to the Ollama server. Check if the server is running or if the ngrok tunnel has expired.'
-        };
+      
+      let safeMessage = 'The AI model is currently unavailable. Please try again later.';
+      if (error.message) {
+        const msg = error.message.toLowerCase();
+        if (msg.includes('429') || msg.includes('rate limit') || msg.includes('rate_limit')) {
+          safeMessage = "I'm currently experiencing high traffic and hit a rate limit. Please wait a moment and try asking me again!";
+        } else if (msg.includes('llm api error') || msg.includes('fetch failed')) {
+          safeMessage = "I encountered a minor internal glitch processing that request. Could you please rephrase or try again?";
+        } else if (!error.message.trim().startsWith('<')) {
+          safeMessage = error.message;
+        }
       }
+
       return {
         role: 'assistant',
-        content: `Sorry, I encountered an error communicating with the database or LLM: ${error.message}`
+        content: safeMessage
       };
     }
   }
