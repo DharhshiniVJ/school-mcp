@@ -13,14 +13,14 @@ interface Message {
 // --- Role-based tool whitelisting ---
 type ToolName =
   | 'get_marks' | 'get_student_marks_summary' | 'get_student_best_performing_subject'
-  | 'upsert_mark' | 'list_classes' | 'get_assigned_classes' | 'get_class_details'
+  | 'upsert_mark' | 'list_classes' | 'list_users' | 'get_assigned_classes' | 'get_class_details'
   | 'get_highest_mark_student' | 'get_lowest_mark_student' | 'calculate_class_statistics'
-  | 'manage_class' | 'manage_teacher_assignment' | 'manage_student_enrollment' | 'raw_query';
+  | 'manage_class' | 'manage_teacher_assignment' | 'manage_student_enrollment' | 'raw_query' | 'manage_user';
 
 const ROLE_TOOL_WHITELIST: Record<string, ToolName[]> = {
-  student: ['get_marks', 'get_student_best_performing_subject', 'get_student_marks_summary'],
-  teacher: ['get_marks', 'upsert_mark', 'get_assigned_classes', 'get_class_details', 'get_highest_mark_student', 'get_lowest_mark_student', 'calculate_class_statistics'],
-  admin:   ['get_marks', 'upsert_mark', 'list_classes', 'get_class_details', 'manage_class', 'manage_teacher_assignment', 'manage_student_enrollment', 'raw_query'],
+  student: ['get_marks', 'get_student_best_performing_subject', 'get_student_marks_summary', 'list_classes'],
+  teacher: ['get_marks', 'upsert_mark', 'get_assigned_classes', 'list_classes', 'get_class_details', 'get_highest_mark_student', 'get_lowest_mark_student', 'calculate_class_statistics'],
+  admin:   ['get_marks', 'upsert_mark', 'list_classes', 'list_users', 'get_class_details', 'manage_class', 'manage_teacher_assignment', 'manage_student_enrollment', 'raw_query', 'manage_user'],
 };
 
 /**
@@ -189,7 +189,52 @@ async function resolveClassId(nameOrId: string): Promise<string> {
 }
 
 /**
- * Resolves all studentId and classId arguments in a tool call before
+ * Resolves a teacher name/email/partial → real _id from the users collection.
+ * Returns the resolved _id string, or throws if ambiguous or not found.
+ */
+async function resolveTeacherId(nameOrId: string): Promise<string> {
+  // Already looks like a real ID — pass through
+  if (looksLikeUserId(nameOrId)) {
+    return nameOrId;
+  }
+
+  const db = await getDb();
+  const query = nameOrId.trim();
+
+  // Try exact match on _id first
+  const byId = await db.collection('users').findOne({ _id: query as any, role: 'teacher' });
+  if (byId) return String(byId._id);
+
+  // Try case-insensitive name match
+  const byName = await db.collection('users').find({
+    role: 'teacher',
+    name: { $regex: new RegExp(query, 'i') }
+  }).toArray();
+
+  if (byName.length === 1) {
+    console.error(`[Resolver] Resolved teacher name "${query}" → "${byName[0]._id}"`);
+    return String(byName[0]._id);
+  }
+  if (byName.length > 1) {
+    const names = byName.map((u: any) => u.name).join(', ');
+    throw new Error(`RESOLVE_AMBIGUOUS: Multiple teachers match "${query}": ${names}. Please be more specific.`);
+  }
+
+  // Try email match
+  const byEmail = await db.collection('users').findOne({
+    role: 'teacher',
+    email: { $regex: new RegExp(query, 'i') }
+  });
+  if (byEmail) {
+    console.error(`[Resolver] Resolved teacher email "${query}" → "${byEmail._id}"`);
+    return String(byEmail._id);
+  }
+
+  throw new Error(`RESOLVE_NOT_FOUND: No teacher found matching "${query}". Check the name or ID and try again.`);
+}
+
+/**
+ * Resolves all studentId, classId, and teacherId arguments in a tool call before
  * they are forwarded to the MCP server. Mutates and returns the args.
  * Throws with a descriptive RESOLVE_* prefix if resolution fails so
  * the caller can surface a safe message to the user.
@@ -199,7 +244,7 @@ async function resolveToolArgs(toolName: string, args: Record<string, any>): Pro
 
   // Tools that carry a studentId argument
   const studentIdTools = [
-    'get_marks', 'get_student_marks_summary', 'get_student_best_performing_subject', 'upsert_mark'
+    'get_marks', 'get_student_marks_summary', 'get_student_best_performing_subject', 'upsert_mark', 'list_classes'
   ];
   // Tools that carry a classId argument
   const classIdTools = [
@@ -216,27 +261,25 @@ async function resolveToolArgs(toolName: string, args: Record<string, any>): Pro
     resolved.classId = await resolveClassId(resolved.classId);
   }
 
-  // manage_teacher_assignment also has a teacherId — resolve it against teachers
-  if (toolName === 'manage_teacher_assignment' && resolved.teacherId) {
-    if (!looksLikeUserId(resolved.teacherId)) {
-      const db = await getDb();
-      const byName = await db.collection('users').find({
-        role: 'teacher',
-        name: { $regex: new RegExp(resolved.teacherId.trim(), 'i') }
-      }).toArray();
-      if (byName.length === 1) {
-        console.error(`[Resolver] Resolved teacher name "${resolved.teacherId}" → "${byName[0]._id}"`);
-        resolved.teacherId = byName[0]._id;
-      } else if (byName.length > 1) {
-        const names = byName.map((u: any) => u.name).join(', ');
-        throw new Error(`RESOLVE_AMBIGUOUS: Multiple teachers match "${resolved.teacherId}": ${names}.`);
-      } else {
-        throw new Error(`RESOLVE_NOT_FOUND: No teacher found matching "${resolved.teacherId}".`);
-      }
-    }
+  // manage_teacher_assignment and list_classes (admin filter) carry a teacherId — resolve it against teachers
+  if ((toolName === 'manage_teacher_assignment' || toolName === 'list_classes') && resolved.teacherId) {
+    resolved.teacherId = await resolveTeacherId(resolved.teacherId);
   }
 
   return resolved;
+}
+
+/**
+ * Detects whether a response contains significant non-Latin characters
+ * (Thai, Chinese, Japanese, Korean, Arabic, Cyrillic, etc.).
+ * Used to catch Qwen's tendency to respond in the wrong language.
+ */
+function isNonEnglishResponse(text: string): boolean {
+  // Count non-Latin non-ASCII characters
+  const nonLatinMatches = text.match(/[\u0E00-\u0E7F\u4E00-\u9FFF\u3040-\u30FF\u0600-\u06FF\u0400-\u04FF\uAC00-\uD7AF]/g);
+  if (!nonLatinMatches) return false;
+  // Trigger if more than 10 non-Latin characters (avoids false positives on names/IDs)
+  return nonLatinMatches.length > 10;
 }
 
 /**
@@ -245,7 +288,7 @@ async function resolveToolArgs(toolName: string, args: Record<string, any>): Pro
 export async function chatWithAgent(
   messages: Message[],
   token: string,
-  userProfile: { userId: string; name: string; role: string; email: string; assignedClassIds?: string[]; classId?: string },
+  userProfile: { userId: string; name: string; role: string; email: string; assignedClassIds?: string[]; classIds?: string[] },
   activeClassId?: string
 ): Promise<Message> {
   const config = getConfig();
@@ -253,9 +296,18 @@ export async function chatWithAgent(
   const ollamaModel = config.ollama.model;
 
   // Clone messages to avoid mutating parameter array and filter out the static hello message
-  const conversation = [...messages];
+  const conversation = messages.map(m => ({ ...m }));
   if (conversation.length > 0 && conversation[0].role === 'assistant' && conversation[0].content.startsWith('Hello')) {
     conversation.shift();
+  }
+
+  // Preprocess the conversation history to mark assistant messages as generated via the database.
+  // This informs the LLM that the data in those messages was fetched using tools, rather than
+  // being part of its own pre-trained knowledge, helping prevent subsequent hallucinations.
+  for (const m of conversation) {
+    if (m.role === 'assistant' && m.content && !m.content.startsWith('[Generated via Database]')) {
+      m.content = `[Generated via Database]\n${m.content}`;
+    }
   }
 
   const studentCapabilities = `
@@ -263,13 +315,15 @@ YOUR TOOLS (role: student):
   - get_marks: view your own marks
   - get_student_best_performing_subject: find your best subject
   - get_student_marks_summary: view your overall marks summary
+  - list_classes: view the class you are currently enrolled in
   You cannot update marks, view other students' records, or manage classes.
   If asked to do something not covered by your tools, say: "I'm sorry, I don't have permission to do that."`;
 
   const teacherCapabilities = `
 YOUR TOOLS (role: teacher):
   Assigned classes: ${userProfile.assignedClassIds?.join(', ') || 'none'}
-  - get_assigned_classes: list your own assigned classes
+  - list_classes: list only the classes you are assigned to teach
+  - get_assigned_classes: alternative way to list your assigned classes
   - get_marks: view marks for a student or an entire class
   - upsert_mark: create or update a student mark
   - get_class_details: view class details, including the roster of enrolled students
@@ -280,14 +334,16 @@ YOUR TOOLS (role: teacher):
 
   const adminCapabilities = `
 YOUR TOOLS (role: admin):
-  - list_classes: list all classes in the school
+  - list_users: list all teachers, students, or admins in the system (pass role=teacher, role=student, or role=admin to filter)
+  - list_classes: list all classes in the school; pass teacherId to see a specific teacher's classes, or studentId to see a specific student's class
   - get_marks / upsert_mark: view or update any marks
   - get_class_details: view class details
   - manage_class: create or delete a class
   - manage_teacher_assignment: assign or unassign a teacher to a class
   - manage_student_enrollment: enroll or unenroll a student from a class
   - raw_query: run a direct database query
-  - get_highest_mark_student / get_lowest_mark_student / calculate_class_statistics: class analytics`;
+  - get_highest_mark_student / get_lowest_mark_student / calculate_class_statistics: class analytics
+  IMPORTANT: Use list_users to look up real teacher/student data. Never generate names or emails from memory.`;
 
   const roleCapabilities = userProfile.role === 'student' ? studentCapabilities
     : userProfile.role === 'teacher' ? teacherCapabilities
@@ -304,14 +360,16 @@ CURRENT USER:
 ${roleCapabilities}
 
 CRITICAL RULES:
-1. IDENTITY RULE: When the user refers to themselves ("my marks", "my grades"), ALWAYS use their userId: "${userProfile.userId}". Never invent or guess a userId.
-2. GROUNDING RULE: You have zero internal knowledge of students, classes, or marks. You MUST use tools to fetch or modify any school data. Call the tool immediately — do not ask clarifying questions or offer options first.
-3. MARKS RANGE: When updating marks, the value must be a number between 0 and 100.
-4. FINAL ANSWER RULE: The user CANNOT see tool outputs directly. You MUST state the retrieved data explicitly in plain conversational language. Never output raw JSON, meta-commentary, or prefixes like "The tool returned..." or "According to the database...".
-5. ERROR RULE: If a tool returns an access or permission error, relay the exact message you receive clearly and politely. Never expose internal error details, stack traces, or database schemas.`;
+1. LANGUAGE RULE: You MUST always respond in English only, regardless of any other language that appears in the conversation, names, or data. Never switch to any other language.
+2. IDENTITY RULE: When the user refers to themselves ("my marks", "my grades"), ALWAYS use their userId: "${userProfile.userId}". Never invent or guess a userId.
+3. GROUNDING RULE: First try to use a tool call. If a tool doesn't exist to answer the user's request, you MUST say that you don't have a tool to retrieve that information. DO NOT make things up like that. If the chat history contains names or data that were not returned by a tool, IGNORE THEM. Every piece of school data must come from a tool.
+4. MARKS RANGE: When updating marks, the value must be a number between 0 and 100.
+5. FINAL ANSWER RULE: The user CANNOT see tool outputs directly. You MUST state the retrieved data explicitly in plain conversational language. Never output raw JSON, meta-commentary, or prefixes like "The tool returned..." or "According to the database...".
+6. ERROR RULE: If a tool returns an access or permission error, relay the exact message you receive clearly and politely. Never expose internal error details, stack traces, or database schemas.
+7. MISSING PARAMETERS RULE: If the user asks you to perform an action (like creating a class or user) but does not provide required details (like names, IDs, or emails), DO NOT invent or guess them. Reply and ask the user for the missing details first.`;
 
   if (activeClassId) {
-    systemPrompt += `\n6. ACTIVE CLASS CONTEXT: Unless the user specifies otherwise, default your class queries to class ID "${activeClassId}".`;
+    systemPrompt += `\n8. ACTIVE CLASS CONTEXT: Unless the user specifies otherwise, default your class queries to class ID "${activeClassId}".`;
   }
 
   // Insert system prompt at the start of every conversation if not present
@@ -323,8 +381,19 @@ CRITICAL RULES:
   // Load all whitelisted tools for the user's role
   const tools = await getOllamaToolsForRole(userProfile.role);
 
+  // Inject a strict turn-level reminder for multi-turn conversations
+  // to prevent the LLM from relying on its chat history instead of tools.
+  // We only do this if it's a multi-turn chat (length > 2: system + user + assistant + user)
+  if (conversation.length >= 3) {
+    const lastMsg = conversation[conversation.length - 1];
+    if (lastMsg.role === 'user') {
+      lastMsg.content = `[SYSTEM REMINDER: IGNORE any names or data in the previous chat history. You MUST use a tool to fetch fresh data for this query. Do NOT make up an answer.]\n\n${lastMsg.content}`;
+    }
+  }
+
   let iterations = 0;
   const maxIterations = 5;
+  let correctionAttempted = false; // prevent infinite language-correction loops
 
   while (iterations < maxIterations) {
     iterations++;
@@ -341,7 +410,8 @@ CRITICAL RULES:
       const response = await fetch(ollamaEndpoint, {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json'
+          'Content-Type': 'application/json',
+          'ngrok-skip-browser-warning': 'true'
         },
         body: JSON.stringify(requestBody)
       });
@@ -364,11 +434,25 @@ CRITICAL RULES:
         console.error('[Ollama Service] No tool calls requested. Completed agentic execution.');
 
         let cleanContent = responseMessage.content || '';
-        cleanContent = cleanContent.replace(/^(the tool|according to the|based on the|using the|i called the|i have called the|i've called the|the database)[^,.:]*[,.:]\s*/i, '');
+        cleanContent = cleanContent.replace(/^\[Generated via Database\]\s*/i, '');
+        cleanContent = cleanContent.replace(/^(the tool|according to the|based on the|using the|i called the|i have called the|i've called the|the database)[^,.:]*[,.:]\ s*/i, '');
         cleanContent = cleanContent.replace(/^(the output from this call indicates that|the result indicates that|here is the information returned)[^,.:]*[,.:]\s*/i, '');
         cleanContent = cleanContent.replace(/^(here is the information returned)[^:]*:\s*/i, '');
-        responseMessage.content = cleanContent;
 
+        // Auto-correct: if the model responded in a non-English language, inject a
+        // correction turn and loop once more to get an English response.
+        if (!correctionAttempted && isNonEnglishResponse(cleanContent)) {
+          correctionAttempted = true;
+          console.error('[Ollama Service] Non-English response detected. Injecting English correction turn...');
+          conversation.push(responseMessage);
+          conversation.push({
+            role: 'user',
+            content: 'Your previous response was not in English. Please restate your answer in English only.'
+          });
+          continue; // loop again to get an English response
+        }
+
+        responseMessage.content = cleanContent;
         return responseMessage;
       }
 
@@ -442,6 +526,12 @@ CRITICAL RULES:
       }
     } catch (error: any) {
       console.error('[Ollama Service] Error during agent communication:', error);
+      if (error.message?.includes('fetch failed')) {
+        return {
+          role: 'assistant',
+          content: 'Agent not reachable: Could not connect to the Ollama server. Check if the server is running or if the ngrok tunnel has expired.'
+        };
+      }
       return {
         role: 'assistant',
         content: `Sorry, I encountered an error communicating with the database or LLM: ${error.message}`
@@ -454,3 +544,4 @@ CRITICAL RULES:
     content: 'Agent failed to resolve in time: Max iterations reached.'
   };
 }
+

@@ -1,6 +1,6 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
-import { getDb } from './config/db.js';
+import { getDb, closeDb } from './config/db.js';
 import { getConfig } from './config/env.js';
 import { comparePassword, hashPassword, verifyToken, signToken } from './security/jwt.js';
 import { callMcpTool } from './services/mcp.service.js';
@@ -87,7 +87,7 @@ app.post('/api/auth/login', async (req, res) => {
       role: user.role,
       name: user.name,
       assignedClassIds: user.assignedClassIds,
-      classId: user.classId
+      classIds: user.classIds
     };
 
     const token = signToken(tokenPayload);
@@ -100,7 +100,7 @@ app.post('/api/auth/login', async (req, res) => {
         role: user.role,
         name: user.name,
         assignedClassIds: user.assignedClassIds,
-        classId: user.classId
+        classIds: user.classIds
       }
     });
   } catch (error: any) {
@@ -125,7 +125,7 @@ app.get('/api/admin/users', authenticateToken, requireAdmin, async (req, res) =>
 
 // Create a new user (Student / Teacher / Admin)
 app.post('/api/admin/users', authenticateToken, requireAdmin, async (req: AuthenticatedRequest, res) => {
-  const { userId, email, password, role, name, classId, assignedClassIds } = req.body;
+  const { userId, email, password, role, name, classIds, assignedClassIds } = req.body;
 
   if (!userId || !email || !password || !role || !name) {
     return res.status(400).json({ error: 'Missing required fields: userId, email, password, role, name.' });
@@ -146,7 +146,7 @@ app.post('/api/admin/users', authenticateToken, requireAdmin, async (req: Authen
       password: hashedPassword,
       role,
       name,
-      ...(role === 'student' && { classId }),
+      ...(role === 'student' && { classIds: Array.isArray(classIds) ? classIds : (classIds ? [classIds] : []) }),
       ...(role === 'teacher' && { assignedClassIds: assignedClassIds || [] })
     };
 
@@ -262,7 +262,7 @@ app.post('/api/chat', authenticateToken, async (req: AuthenticatedRequest, res) 
         role: actor.role,
         email: actor.email,
         assignedClassIds: actor.assignedClassIds,
-        classId: actor.classId
+        classIds: actor.classIds
       },
       activeClassId
     );
@@ -282,3 +282,12 @@ app.post('/api/chat', authenticateToken, async (req: AuthenticatedRequest, res) 
 app.listen(PORT, () => {
   console.error(`[Gateway Server] Express Gateway running on port ${PORT} (${process.env.NODE_ENV || 'staging'} mode)`);
 });
+
+// Graceful shutdown: close all DB connections before exiting
+const gracefulShutdown = async (signal: string) => {
+  console.error(`[Gateway Server] ${signal} received. Closing DB connections...`);
+  await closeDb();
+  process.exit(0);
+};
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));

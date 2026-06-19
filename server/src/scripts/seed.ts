@@ -78,7 +78,7 @@ async function seed() {
         password: studentPassword,
         role: 'student',
         name: 'Charlie Simpson',
-        classId: 'class-math-101',
+        classIds: ['class-math-101'],
       },
       {
         _id: 'user-student-david',
@@ -86,7 +86,7 @@ async function seed() {
         password: studentPassword,
         role: 'student',
         name: 'David Gumble',
-        classId: 'class-science-101',
+        classIds: ['class-science-101'],
       },
       {
         _id: 'user-student-eve',
@@ -94,7 +94,7 @@ async function seed() {
         password: studentPassword,
         role: 'student',
         name: 'Eve Bouvier',
-        classId: 'class-math-101',
+        classIds: ['class-math-101'],
       },
       {
         _id: 'user-student-frank',
@@ -102,7 +102,7 @@ async function seed() {
         password: studentPassword,
         role: 'student',
         name: 'Frank Grimes Jr.',
-        classId: 'class-english-101',
+        classIds: ['class-english-101'],
       },
     ];
     await db.collection<User>('users').insertMany(users);

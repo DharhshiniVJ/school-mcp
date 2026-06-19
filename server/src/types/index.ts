@@ -6,7 +6,7 @@ export interface JWTPayload {
   role: UserRole;
   name: string;
   assignedClassIds?: string[];
-  classId?: string;
+  classIds?: string[];       // Classes the student is enrolled in
 }
 
 export interface User {
@@ -16,7 +16,7 @@ export interface User {
   role: UserRole;
   name: string;
   assignedClassIds?: string[]; // Array of Class IDs for Teachers
-  classId?: string; // Class ID for Students
+  classIds?: string[];          // Array of Class IDs for Students (can be enrolled in multiple)
 }
 
 export interface Class {

@@ -66,7 +66,7 @@ async function getTeacherStudents(teacherId: string, db: Db): Promise<string[]> 
 
   const students = await db.collection<User>('users').find({
     role: 'student',
-    classId: { $in: teacher.assignedClassIds }
+    classIds: { $in: teacher.assignedClassIds }
   }).toArray();
 
   return students.map(s => s._id);
@@ -152,7 +152,7 @@ async function enforceRebac(
     // Check Student-based access (e.g. upserting or fetching marks for a student)
     if (directStudentId) {
       const student = await db.collection<User>('users').findOne({ _id: directStudentId, role: 'student' });
-      if (!student || !student.classId || !assignedClassIds.includes(student.classId)) {
+      if (!student || !student.classIds?.length || !student.classIds.some(cid => assignedClassIds.includes(cid))) {
         throw new Error(`Access Denied: Student is not enrolled in any of your assigned classes.`);
       }
       return;

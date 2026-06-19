@@ -37,7 +37,7 @@ production:
     expiresIn: "2h"
   ollama:
     endpoint: "http://localhost:11434"
-    model: "llama3.1:8b"
+    model: "qwen2.5:14b"
   security:
     allowDestructiveCommands: false
     enableFirewall: true

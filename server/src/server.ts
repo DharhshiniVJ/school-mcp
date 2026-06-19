@@ -4,7 +4,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import { getDb } from './config/db.js';
+import { getDb, closeDb } from './config/db.js';
 import { verifyToken, signToken } from './security/jwt.js';
 import { runSecurityPipeline } from './security/pipeline.js';
 import { JWTPayload, User, Mark, Class } from './types/index.js';
@@ -60,10 +60,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'list_classes',
-        description: 'Retrieve a list of ALL classes available in the ENTIRE school system (including classes taught by other teachers). To know which classes the current user teaches, refer to the CURRENT USER assignedClassIds in your system prompt.',
+        description: 'Retrieve classes for the current user. Students see the class they are enrolled in. Teachers see only the classes they are assigned to teach. Admins see all classes in the school, and can optionally filter by teacherId (to list a specific teacher\'s assigned classes) or studentId (to list a specific student\'s enrolled class).',
         inputSchema: {
           type: 'object',
-          properties: {},
+          properties: {
+            teacherId: { type: 'string', description: 'Admin only: the teacher\'s user ID to list only their assigned classes.' },
+            studentId: { type: 'string', description: 'Admin only: the student\'s user ID to list their enrolled class.' },
+          },
         },
       },
       {
@@ -155,6 +158,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: 'list_users',
+        description: 'Admin tool to list all users in the system, optionally filtered by role. Returns name, email, role, and class/assignment info. Never returns passwords.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            role: { type: 'string', enum: ['teacher', 'student', 'admin'], description: 'Filter users by role.' },
+          },
+          required: ['role'],
+        },
+      },
+      {
         name: 'manage_class',
         description: 'Admin tool to create or delete a class.',
         inputSchema: {
@@ -192,6 +206,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
           required: ['studentId', 'classId', 'action'],
         },
+      },
+      {
+        name: 'manage_user',
+        description: 'Admin tool to create or delete users (teachers or students).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['create', 'delete'] },
+            role: { type: 'string', enum: ['student', 'teacher', 'admin'] },
+            email: { type: 'string', description: 'The user email address.' },
+            name: { type: 'string', description: 'The user full name (required for create).' }
+          },
+          required: ['action', 'role', 'email']
+        }
       },
       {
         name: 'raw_query',
@@ -304,7 +332,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           } else if (!studentId) {
             // Teacher queries all marks for all assigned classes
             const students = await db.collection<User>('users')
-              .find({ role: 'student', classId: { $in: assignedClassIds } })
+              .find({ role: 'student', classIds: { $in: assignedClassIds } })
               .toArray();
             const studentIds = students.map(s => s._id);
             query.studentId = { $in: studentIds };
@@ -338,28 +366,115 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'list_classes': {
-        requireRole(actor, ['admin'], 'list_classes');
-        // Pipeline validation
-        await runSecurityPipeline(actor, 'classes', {}, null, null, false, db);
-
-        const classes = await db.collection<Class>('classes').find().toArray();
-        
-        // Resolve assigned teachers for each class
-        const classesWithTeachers = await Promise.all(classes.map(async (cls) => {
-          const teacher = await db.collection<User>('users').findOne({
-            role: 'teacher',
-            assignedClassIds: cls._id
-          });
+        if (actor.role === 'student') {
+          // Students: return all classes they are enrolled in
+          const enrolledClassIds = actor.classIds || [];
+          if (enrolledClassIds.length === 0) {
+            return { content: [{ type: 'text', text: 'You are not currently enrolled in any classes.' }] };
+          }
+          // Use admin connection since student DB user lacks access to classes collection
+          const adminDb = await getDb('admin');
+          const classes = await adminDb.collection<Class>('classes')
+            .find({ _id: { $in: enrolledClassIds } })
+            .toArray();
           return {
-            classId: cls._id,
-            className: cls.name,
-            assignedTeacherName: teacher ? teacher.name : 'Unassigned',
-            assignedTeacherEmail: teacher ? teacher.email : 'Unassigned'
+            content: [{ type: 'text', text: JSON.stringify(classes, null, 2) }],
           };
-        }));
+
+        } else if (actor.role === 'teacher') {
+          // Teachers: return only their assigned classes
+          const assignedClassIds = actor.assignedClassIds || [];
+          if (assignedClassIds.length === 0) {
+            return { content: [{ type: 'text', text: 'You are not currently assigned to any classes.' }] };
+          }
+          // Teacher DB user has read access to the classes collection
+          const classes = await db.collection<Class>('classes')
+            .find({ _id: { $in: assignedClassIds } })
+            .toArray();
+          return {
+            content: [{ type: 'text', text: JSON.stringify(classes, null, 2) }],
+          };
+
+        } else {
+          // Admin: return all classes, with optional filtering by teacherId or studentId
+          requireRole(actor, ['admin'], 'list_classes');
+          await runSecurityPipeline(actor, 'classes', {}, null, null, false, db);
+
+          const filterTeacherId = args?.teacherId as string | undefined;
+          const filterStudentId = args?.studentId as string | undefined;
+
+          if (filterTeacherId) {
+            // Return classes assigned to a specific teacher
+            const teacher = await db.collection<User>('users').findOne({ _id: filterTeacherId, role: 'teacher' });
+            if (!teacher) {
+              throw new Error(`No teacher found with ID "${filterTeacherId}".`);
+            }
+            const assignedClassIds = teacher.assignedClassIds || [];
+            if (assignedClassIds.length === 0) {
+              return { content: [{ type: 'text', text: `Teacher ${teacher.name} is not assigned to any classes.` }] };
+            }
+            const classes = await db.collection<Class>('classes')
+              .find({ _id: { $in: assignedClassIds } })
+              .toArray();
+            return {
+              content: [{ type: 'text', text: JSON.stringify({ teacher: teacher.name, classes }, null, 2) }],
+            };
+          }
+
+          if (filterStudentId) {
+            // Return all classes a specific student is enrolled in
+            const student = await db.collection<User>('users').findOne({ _id: filterStudentId, role: 'student' });
+            if (!student) {
+              throw new Error(`No student found with ID "${filterStudentId}".`);
+            }
+            if (!student.classIds?.length) {
+              return { content: [{ type: 'text', text: `Student ${student.name} is not enrolled in any classes.` }] };
+            }
+            const classes = await db.collection<Class>('classes')
+              .find({ _id: { $in: student.classIds } })
+              .toArray();
+            return {
+              content: [{ type: 'text', text: JSON.stringify({ student: student.name, classes }, null, 2) }],
+            };
+          }
+
+          // No filter: return all classes with teacher assignments
+          const classes = await db.collection<Class>('classes').find().toArray();
+          const classesWithTeachers = await Promise.all(classes.map(async (cls) => {
+            const teacher = await db.collection<User>('users').findOne({
+              role: 'teacher',
+              assignedClassIds: cls._id
+            });
+            return {
+              classId: cls._id,
+              className: cls.name,
+              assignedTeacherName: teacher ? teacher.name : 'Unassigned',
+              assignedTeacherEmail: teacher ? teacher.email : 'Unassigned'
+            };
+          }));
+          return {
+            content: [{ type: 'text', text: JSON.stringify(classesWithTeachers, null, 2) }],
+          };
+        }
+      }
+
+      case 'list_users': {
+        requireRole(actor, ['admin'], 'list_users');
+        await runSecurityPipeline(actor, 'users', {}, null, null, false, db);
+
+        const roleFilter = args?.role as string | undefined;
+        const filter: Record<string, any> = {};
+        if (roleFilter) {
+          filter.role = roleFilter;
+        }
+
+        const users = await db.collection<User>('users').find(filter).toArray();
+
+        // Strip passwords before returning
+        const safeUsers = users.map(({ password, ...rest }) => rest);
 
         return {
-          content: [{ type: 'text', text: JSON.stringify(classesWithTeachers, null, 2) }],
+          content: [{ type: 'text', text: JSON.stringify(safeUsers, null, 2) }],
         };
       }
 
@@ -439,7 +554,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (!student) {
           throw new Error(`Student ${studentId} does not exist.`);
         }
-        if (student.classId !== classId) {
+        if (!student.classIds?.includes(classId)) {
           throw new Error(`Student ${studentId} is not enrolled in class ${classId}.`);
         }
 
@@ -633,6 +748,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const classId = args?.classId as string;
         const className = args?.className as string | undefined;
 
+        if (!classId) {
+          throw new Error('classId is absolutely required for manage_class operations.');
+        }
+
         // Pipeline validation (Requires admin role)
         await runSecurityPipeline(actor, 'classes', {}, null, null, true, db);
 
@@ -648,13 +767,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return {
             content: [{ type: 'text', text: `Class "${classId}" (${className}) created successfully.` }],
           };
-        } else {
+        } else if (action === 'delete') {
           const result = await db.collection<Class>('classes').deleteOne({ _id: classId });
           // Also clean up any marks
           await db.collection<Mark>('marks').deleteMany({ classId });
           return {
             content: [{ type: 'text', text: `Class "${classId}" deleted. Removed matching marks. Deleted count: ${result.deletedCount}` }],
           };
+        } else {
+          throw new Error(`Invalid action "${action}" for manage_class. Must be 'create' or 'delete'. If you want to assign a teacher, use the manage_teacher_assignment tool instead.`);
         }
       }
 
@@ -732,7 +853,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
           await db.collection<User>('users').updateOne(
             { _id: studentId },
-            { $set: { classId } }
+            { $addToSet: { classIds: classId } }
           );
           return {
             content: [{ type: 'text', text: `Student ${studentId} enrolled in class ${classId}.` }],
@@ -740,11 +861,62 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         } else {
           await db.collection<User>('users').updateOne(
             { _id: studentId },
-            { $unset: { classId: '' } }
+            { $pull: { classIds: classId } }
           );
           return {
-            content: [{ type: 'text', text: `Student ${studentId} unenrolled from class.` }],
+            content: [{ type: 'text', text: `Student ${studentId} unenrolled from class ${classId}.` }],
           };
+        }
+      }
+
+      case 'manage_user': {
+        requireRole(actor, ['admin'], 'manage_user');
+        const action = args?.action as 'create' | 'delete';
+        const role = args?.role as 'student' | 'teacher' | 'admin';
+        const email = args?.email as string;
+        const name = args?.name as string | undefined;
+
+        if (!action || !role || !email) {
+          throw new Error('action, role, and email are required');
+        }
+
+        // Pipeline validation (Requires admin role)
+        await runSecurityPipeline(actor, 'users', {}, null, null, true, db);
+
+        const emailPrefix = email.split('@')[0].replace(/[^a-zA-Z0-9]/g, '-');
+        const userId = `user-${role}-${emailPrefix}`;
+
+        if (action === 'create') {
+          if (!name) {
+            throw new Error('name is required to create a user');
+          }
+          const newUser: User = {
+            _id: userId,
+            email,
+            role,
+            name,
+            password: 'DefaultPassword#2025!', // Auto-generated default password
+            assignedClassIds: role === 'teacher' ? [] : undefined,
+            classIds: role === 'student' ? [] : undefined
+          };
+          await db.collection<User>('users').updateOne(
+            { _id: userId },
+            { $set: newUser },
+            { upsert: true }
+          );
+          return {
+            content: [{ type: 'text', text: `User ${name} (${email}) created successfully with ID ${userId}.` }]
+          };
+        } else if (action === 'delete') {
+          const result = await db.collection<User>('users').deleteOne({ email });
+          if (result.deletedCount === 0) {
+             throw new Error(`User with email ${email} not found.`);
+          }
+          return {
+            content: [{ type: 'text', text: `User with email ${email} deleted successfully.` }]
+          };
+        } else {
+          throw new Error(`Invalid action ${action}`);
         }
       }
 
@@ -790,6 +962,15 @@ async function run() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error('[MCP Server] Running over stdio transport');
+
+  // Graceful shutdown: close all DB connections before exiting
+  const gracefulShutdown = async (signal: string) => {
+    console.error(`[MCP Server] ${signal} received. Closing DB connections...`);
+    await closeDb();
+    process.exit(0);
+  };
+  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 }
 
 run().catch((error) => {
