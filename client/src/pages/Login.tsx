@@ -60,7 +60,7 @@ function Login({ onLoginSuccess }: LoginProps) {
         textAlign: 'left'
       }}>
         <div style={{ textAlign: 'center', marginBottom: '32px' }}>
-          <span style={{ fontSize: '3rem', display: 'block', marginBottom: '12px' }}>🏫</span>
+          <span style={{ fontSize: '3rem', display: 'block', marginBottom: '12px' }}></span>
           <h2 style={{ fontSize: '1.75rem', color: '#fff', fontWeight: '800', fontFamily: 'Outfit' }}>Welcome back</h2>
           <p style={{ color: '#94a3b8', fontSize: '0.85rem', marginTop: '6px' }}>
             Enter your credentials to access the AI Portal

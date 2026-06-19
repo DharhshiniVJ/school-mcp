@@ -432,10 +432,10 @@ function Admin({ token }: AdminProps) {
                           <div style={{ fontSize: '0.75rem', color: '#6366f1', fontWeight: '700' }}>{c._id}</div>
                           <div style={{ fontSize: '1.05rem', fontWeight: '700', color: '#fff', marginTop: '2px' }}>{c.name}</div>
                           <div style={{ fontSize: '0.75rem', color: '#94a3b8', marginTop: '6px' }}>
-                            👨‍🏫 Teacher: {classTeacher ? classTeacher.name : <span style={{ fontStyle: 'italic', color: '#64748b' }}>None</span>}
+                             Teacher: {classTeacher ? classTeacher.name : <span style={{ fontStyle: 'italic', color: '#64748b' }}>None</span>}
                           </div>
                           <div style={{ fontSize: '0.75rem', color: '#94a3b8', marginTop: '2px' }}>
-                            👥 Enrolled: {enrolledCount} {enrolledCount === 1 ? 'student' : 'students'}
+                             Enrolled: {enrolledCount} {enrolledCount === 1 ? 'student' : 'students'}
                           </div>
                         </div>
                         <button className="btn btn-danger" onClick={() => handleDeleteClass(c._id)} style={{ alignSelf: 'flex-end', padding: '4px 10px', fontSize: '0.7rem', marginTop: '12px' }}>

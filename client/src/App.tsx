@@ -92,7 +92,7 @@ function App() {
           backdropFilter: 'blur(8px)'
         }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-            <span style={{ fontSize: '1.8rem' }}>🏫</span>
+            <span style={{ fontSize: '1.8rem' }}></span>
             <div>
               <h1 style={{ fontSize: '1.25rem', fontFamily: 'Outfit', fontWeight: '700', color: '#fff', letterSpacing: '-0.02em' }}>
                 School Management System
